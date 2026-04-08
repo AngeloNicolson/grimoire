@@ -95,12 +95,33 @@ The deck browser shows subjects on the left and decks on the right.
 | `j`/`k` | Scroll response |
 | `q`/`Esc` | Back to card |
 
-## Building
+## Installation
+
+### Quick install (Linux/macOS)
+
+```sh
+curl -sL https://raw.githubusercontent.com/AngeloNicolson/grimoire/main/install.sh | sh
+```
+
+### Arch Linux (AUR)
+
+```sh
+yay -S grimoire-git
+```
+
+### Homebrew (macOS)
+
+```sh
+brew tap AngeloNicolson/grimoire
+brew install grimoire
+```
+
+### Build from source
 
 Requires: C++17 compiler, ncurses, CMake 3.14+
 
 ```sh
-git clone <repo>
+git clone https://github.com/AngeloNicolson/grimoire.git
 cd grimoire
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
