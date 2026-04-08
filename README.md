@@ -112,7 +112,7 @@ yay -S grimoire-git
 ### Homebrew (macOS)
 
 ```sh
-brew tap AngeloNicolson/grimoire
+brew tap AngeloNicolson/grimoire https://github.com/AngeloNicolson/grimoire
 brew install grimoire
 ```
 
