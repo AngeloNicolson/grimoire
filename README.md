@@ -1,6 +1,6 @@
 # Grimoire
 
-A terminal-based flashcard drill system with persistent mastery tracking. Built with C++ and ncurses.
+A terminal-based flashcard drill system with persistent mastery tracking. Built with C++ and ncurses, inspired by [ncmpcpp](https://github.com/ncmpcpp/ncmpcpp).
 
 Grimoire uses a 3-stage mastery system that adapts to your knowledge over time. Cards you know well require fewer repetitions each session, while cards you struggle with demand more. Sessions naturally get shorter as you improve.
 
