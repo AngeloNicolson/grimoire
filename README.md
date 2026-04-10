@@ -55,7 +55,7 @@ One card per line. Empty lines and lines without `::` are ignored.
 Grimoire expects decks organized in subject directories:
 
 ```
-~/knowledge_vault/Study-Vault/Anki/
+~/knowledge_vault/Study-Vault/Grimoire/
   networking/
     week_1/
       protocols.txt
@@ -143,26 +143,32 @@ Deck directory and data file paths are currently hardcoded at the top of `src/ma
 
 ## Feature Plan
 
-### v0.2 - Anki Import
+### v0.2 - Custom Math Renderer
+- [ ] Custom glyph bitmaps for math symbols (fractions, summation, integrals, superscripts, subscripts)
+- [ ] Layout engine to parse math notation and position glyphs
+- [ ] Render to terminal via sixel graphics protocol
+- [ ] Support LaTeX-style input syntax in card text (e.g. `\frac{n!}{k!(n-k)!}`)
+
+### v0.3 - Deck Import
 - [ ] `grimoire import <file.apkg>` command to convert Anki .apkg decks to txt format
 - [ ] Strip HTML from Anki card fields
 - [ ] Handle basic Anki note types (Basic, Basic + Reverse)
 - [ ] Support cloze deletion conversion
 - [ ] Place imported decks into the deck directory with sensible names
 
-### v0.3 - Polish
+### v0.4 - Polish
 - [ ] Config file (~/.config/grimoire/config.toml) for deck dir, data path, colors
 - [ ] Session summary screen (cards drilled, time, stage changes)
 - [ ] Progress bar showing session completion
 - [ ] Deck-level stats view (stage distribution, last drilled)
 
-### v0.4 - Advanced Drilling
+### v0.5 - Advanced Drilling
 - [ ] Tag-based filtering (drill only cards with specific tags)
 - [ ] Worst-cards mode (drill the N cards with lowest mastery)
 - [ ] Timed mode (drill for X minutes then stop)
 - [ ] Undo last answer
 
-### v0.5 - Card Management
+### v0.6 - Card Management
 - [ ] Edit cards in-app (open $EDITOR on the deck file)
 - [ ] Add new cards from within grimoire
 - [ ] Search across all decks
