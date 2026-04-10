@@ -18,7 +18,7 @@ using json = nlohmann::json;
 
 // --- Config ---
 
-static const std::string DECK_DIR = "~/knowledge_vault/Study-Vault/Anki";
+static const std::string DECK_DIR = "~/knowledge_vault/Study-Vault/Grimoire";
 static const std::string DATA_FILE = "~/.local/share/grimoire/progress.json";
 
 static std::string expand_home(const std::string& path) {
@@ -41,19 +41,43 @@ struct DeckEntry {
     bool is_dir;
 };
 
-static std::vector<Card> parse_deck(const std::string& path) {
+struct Deck {
+    std::string summary;
     std::vector<Card> cards;
+};
+
+static Deck parse_deck(const std::string& path) {
+    Deck deck;
     std::ifstream file(path);
     std::string line;
+    bool past_separator = false;
     while (std::getline(file, line)) {
+        // Check for --- separator (summary delimiter)
+        if (!past_separator) {
+            std::string trimmed = line;
+            while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
+                trimmed.pop_back();
+            if (trimmed == "---") {
+                past_separator = true;
+                continue;
+            }
+        }
         auto sep = line.find(" :: ");
-        if (sep == std::string::npos) continue;
+        if (sep == std::string::npos) {
+            // Before any cards and no separator yet — accumulate as summary
+            if (!past_separator && deck.cards.empty() && !line.empty()) {
+                if (!deck.summary.empty()) deck.summary += "\n";
+                deck.summary += line;
+            }
+            continue;
+        }
+        past_separator = true; // once we see a card, summary is done
         std::string q = line.substr(0, sep);
         std::string a = line.substr(sep + 4);
         if (q.empty() || a.empty()) continue;
-        cards.push_back({q, a});
+        deck.cards.push_back({q, a});
     }
-    return cards;
+    return deck;
 }
 
 static std::vector<DeckEntry> list_dir(const std::string& dir) {
@@ -841,6 +865,112 @@ static std::string deck_id_from_path(const std::string& path, const std::string&
     return rel;
 }
 
+// Pre-drill summary screen — shows deck info and stats, waits for keypress to begin
+// Returns true to start drill, false to go back to browser
+static bool show_deck_summary(const std::string& deck_name, const std::string& summary,
+                               const std::string& deck_id, int card_count, Progress& progress) {
+    timeout(-1); // block until keypress
+    while (true) {
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+
+        int content_w = std::min(max_x - 4, 60);
+        int cx = (max_x - content_w) / 2;
+        int y = 1;
+
+        // Title
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(y, (max_x - (int)deck_name.size()) / 2, "%s", deck_name.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        y += 2;
+
+        draw_hline_full(y, 0, max_x);
+        y += 2;
+
+        // Summary text
+        if (!summary.empty()) {
+            auto lines = wrap_text(summary, content_w);
+            attron(COLOR_PAIR(CLR_DEFAULT));
+            for (auto& l : lines) {
+                mvprintw(y, cx, "%s", l.c_str());
+                y++;
+            }
+            attroff(COLOR_PAIR(CLR_DEFAULT));
+            y += 1;
+            draw_hline_full(y, 0, max_x);
+            y += 2;
+        }
+
+        // Card stage distribution
+        int new_count = 0, familiar_count = 0, strong_count = 0;
+        for (int i = 0; i < card_count; i++) {
+            int stage = progress.get_stage(deck_id, i);
+            if (stage == 0) new_count++;
+            else if (stage == 1) familiar_count++;
+            else strong_count++;
+        }
+
+        char total_str[64];
+        snprintf(total_str, sizeof(total_str), "Cards: %d", card_count);
+        attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        mvprintw(y, cx, "%s", total_str);
+        attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        y += 2;
+
+        // Stage bars
+        int bar_w = content_w - 16;
+        auto draw_bar = [&](const char* label, int count, int color) {
+            attron(COLOR_PAIR(color));
+            mvprintw(y, cx, "%-10s %3d  ", label, count);
+            attroff(COLOR_PAIR(color));
+            if (card_count > 0 && bar_w > 0) {
+                int filled = (count * bar_w) / card_count;
+                attron(COLOR_PAIR(color));
+                for (int i = 0; i < filled; i++) addch(ACS_BLOCK);
+                attroff(COLOR_PAIR(color));
+                attron(COLOR_PAIR(CLR_DIM));
+                for (int i = filled; i < bar_w; i++) addch(ACS_BULLET);
+                attroff(COLOR_PAIR(CLR_DIM));
+            }
+            y++;
+        };
+
+        draw_bar("New", new_count, CLR_STAGE_NEW);
+        draw_bar("Familiar", familiar_count, CLR_STAGE_FAMILIAR);
+        draw_bar("Strong", strong_count, CLR_STAGE_STRONG);
+
+        // Deck stats (completions/abandonments)
+        if (progress.deck_stats.contains(deck_id)) {
+            auto& ds = progress.deck_stats[deck_id];
+            y += 2;
+            draw_hline_full(y, 0, max_x);
+            y += 2;
+            int completed = ds.value("completed", 0);
+            int abandoned = ds.value("abandoned", 0);
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(y, cx, "Sessions completed: %d", completed);
+            y++;
+            mvprintw(y, cx, "Sessions abandoned: %d", abandoned);
+            attroff(COLOR_PAIR(CLR_DIM));
+        }
+
+        // Start prompt
+        y = max_y - 2;
+        std::string hint = "[Enter] Start  [q] Back";
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(y, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        refresh();
+
+        int ch = getch();
+        if (ch == '\n' || ch == ' ') return true;
+        if (ch == 'q' || ch == 27) return false;
+        if (ch == KEY_RESIZE) continue;
+    }
+}
+
 // Drill TUI - centered card with box
 static std::string format_elapsed(time_t start) {
     int elapsed = (int)difftime(time(nullptr), start);
@@ -1116,39 +1246,38 @@ int main(int argc, char* argv[]) {
         init_colors();
     }
 
-    // Browse and select deck
-    std::string deck_path = browse_decks(deck_root);
-    if (deck_path.empty()) {
-        endwin();
-        return 0;
-    }
-
-    // Parse deck
-    auto cards = parse_deck(deck_path);
-    if (cards.empty()) {
-        endwin();
-        fprintf(stderr, "No cards found in %s\n", deck_path.c_str());
-        return 1;
-    }
-
     // Load progress
     Progress progress;
     progress.load();
 
-    // Build deck ID
-    std::string deck_id = deck_id_from_path(deck_path, deck_root);
+    while (true) {
+        // Browse and select deck
+        std::string deck_path = browse_decks(deck_root);
+        if (deck_path.empty()) break;
 
-    // Run drill
-    DrillSession session;
-    session.init(deck_id, std::move(cards), &progress);
-    // Display name: last component of deck_id, replace _ and - with spaces
-    std::string dname = deck_id;
-    auto slash = dname.rfind('/');
-    if (slash != std::string::npos) dname = dname.substr(slash + 1);
-    std::replace(dname.begin(), dname.end(), '_', ' ');
-    std::replace(dname.begin(), dname.end(), '-', ' ');
-    session.deck_name = dname;
-    run_drill(session);
+        // Parse deck
+        auto deck = parse_deck(deck_path);
+        if (deck.cards.empty()) continue;
+
+        // Build deck ID and display name
+        std::string deck_id = deck_id_from_path(deck_path, deck_root);
+        std::string dname = deck_id;
+        auto slash = dname.rfind('/');
+        if (slash != std::string::npos) dname = dname.substr(slash + 1);
+        std::replace(dname.begin(), dname.end(), '_', ' ');
+        std::replace(dname.begin(), dname.end(), '-', ' ');
+
+        // Show summary screen — timer starts after this
+        if (!show_deck_summary(dname, deck.summary, deck_id, (int)deck.cards.size(), progress)) {
+            continue; // back to browser
+        }
+
+        // Run drill
+        DrillSession session;
+        session.init(deck_id, std::move(deck.cards), &progress);
+        session.deck_name = dname;
+        run_drill(session);
+    }
 
     endwin();
     return 0;
