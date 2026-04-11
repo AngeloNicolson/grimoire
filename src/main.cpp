@@ -23,6 +23,7 @@ using json = nlohmann::json;
 
 static const std::string DECK_DIR = "~/knowledge_vault/Study-Vault/Grimoire";
 static const std::string DATA_FILE = "~/.local/share/grimoire/progress.json";
+static const std::string SESSION_FILE = "~/.local/share/grimoire/session.json";
 
 static std::string expand_home(const std::string& path) {
     if (path.empty() || path[0] != '~') return path;
@@ -245,6 +246,54 @@ struct DrillSession {
         targets[idx] = stage_target(new_stage);
         progress->save();
         missed.push_back(idx);
+    }
+
+    // Save paused session to disk
+    void save_session(const std::string& path, int elapsed) {
+        std::string fpath = expand_home(SESSION_FILE);
+        std::string dir = fs::path(fpath).parent_path().string();
+        fs::create_directories(dir);
+        json j;
+        j["deck_path"] = path;
+        j["deck_id"] = deck_id;
+        j["deck_name"] = deck_name;
+        j["round"] = round;
+        j["missed"] = missed;
+        j["streaks"] = streaks;
+        j["targets"] = targets;
+        j["round_num"] = round_num;
+        j["elapsed"] = elapsed;
+        std::ofstream file(fpath);
+        file << j.dump(2);
+    }
+
+    // Restore session state from saved data
+    void restore(const json& j, std::vector<Card> c, Progress* p) {
+        deck_id = j["deck_id"].get<std::string>();
+        deck_name = j["deck_name"].get<std::string>();
+        cards = std::move(c);
+        progress = p;
+        round = j["round"].get<std::vector<int>>();
+        missed = j["missed"].get<std::vector<int>>();
+        streaks = j["streaks"].get<std::vector<int>>();
+        targets = j["targets"].get<std::vector<int>>();
+        round_num = j["round_num"].get<int>();
+    }
+
+    static void clear_session() {
+        std::string fpath = expand_home(SESSION_FILE);
+        if (fs::exists(fpath)) fs::remove(fpath);
+    }
+
+    static json load_session() {
+        std::string fpath = expand_home(SESSION_FILE);
+        std::ifstream file(fpath);
+        if (!file.is_open()) return json();
+        try {
+            return json::parse(file);
+        } catch (...) {
+            return json();
+        }
     }
 };
 
@@ -678,10 +727,14 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
 }
 
 // Startup splash screen — random logo variant
-static void show_splash() {
+// Returns 'c' to continue paused session, or anything else to browse
+static int show_splash() {
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> dist(0, LOGO_COUNT - 1);
     auto& logo = LOGOS[dist(rng)];
+
+    auto saved = DrillSession::load_session();
+    bool has_session = saved.contains("deck_name");
 
     timeout(-1);
     int max_y, max_x;
@@ -699,13 +752,32 @@ static void show_splash() {
     }
     attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
 
-    std::string hint = "[Press any key]";
+    int hint_y = start_y + logo.height + 3;
+
+    if (has_session) {
+        std::string dname = saved["deck_name"].get<std::string>();
+        int remaining = (int)saved["round"].size() + (int)saved["missed"].size();
+        char cont_str[128];
+        snprintf(cont_str, sizeof(cont_str), "[c] Continue: %s (%d cards left)", dname.c_str(), remaining);
+        attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        mvprintw(hint_y, (max_x - (int)strlen(cont_str)) / 2, "%s", cont_str);
+        attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        hint_y += 2;
+    }
+
+    std::string hint = "[Enter] Browse decks  [q] Quit";
     attron(COLOR_PAIR(CLR_DIM));
-    mvprintw(start_y + logo.height + 3, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
+    mvprintw(hint_y, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
     attroff(COLOR_PAIR(CLR_DIM));
 
     refresh();
-    getch();
+
+    while (true) {
+        int ch = getch();
+        if (ch == 'q' || ch == 27) return 'q';
+        if (ch == 'c' && has_session) return 'c';
+        if (ch == '\n' || ch == ' ' || !has_session) return '\n';
+    }
 }
 
 // Yazi-style 3-column file browser
@@ -1075,8 +1147,9 @@ static std::string format_elapsed(time_t start) {
     return buf;
 }
 
-static void run_drill(DrillSession& session) {
-    time_t session_start = time(nullptr);
+// Returns true if completed, false if paused/quit
+static bool run_drill(DrillSession& session, const std::string& deck_path, int elapsed_offset = 0) {
+    time_t session_start = time(nullptr) - elapsed_offset;
     timeout(1000); // getch returns ERR after 1s so timer updates
     while (true) {
         // Check if round is done
@@ -1113,7 +1186,8 @@ static void run_drill(DrillSession& session) {
                 refresh();
                 timeout(-1); // block for final screen
                 getch();
-                return;
+                DrillSession::clear_session();
+                return true;
             }
         }
 
@@ -1210,7 +1284,13 @@ static void run_drill(DrillSession& session) {
 
             int ch = getch();
             if (ch == ERR) continue; // timeout - redraw for timer
-            if (ch == 'q' || ch == 27) { timeout(-1); return; }
+            if (ch == 'q' || ch == 27) {
+                session.round.push_back(card_idx); // put card back
+                int elapsed = (int)difftime(time(nullptr), session_start);
+                session.save_session(deck_path, elapsed);
+                timeout(-1);
+                return false;
+            }
             if (ch == 'a') { show_ai_assistant(card, session.deck_name); timeout(1000); continue; }
             if (ch == ' ') break;
         }
@@ -1308,7 +1388,13 @@ static void run_drill(DrillSession& session) {
 
             int ch = getch();
             if (ch == ERR) continue; // timeout - redraw for timer
-            if (ch == 'q' || ch == 27) { timeout(-1); return; }
+            if (ch == 'q' || ch == 27) {
+                session.round.push_back(card_idx); // put card back
+                int elapsed = (int)difftime(time(nullptr), session_start);
+                session.save_session(deck_path, elapsed);
+                timeout(-1);
+                return false;
+            }
             if (ch == 'a') { show_ai_assistant(card, session.deck_name); timeout(1000); continue; }
             if (ch == 'y') {
                 session.mark_correct(card_idx);
@@ -1337,39 +1423,56 @@ int main(int argc, char* argv[]) {
         init_colors();
     }
 
-    show_splash();
-
     // Load progress
     Progress progress;
     progress.load();
 
     while (true) {
-        // Browse and select deck
-        std::string deck_path = browse_decks(deck_root);
-        if (deck_path.empty()) break;
+        int splash_ch = show_splash();
+        if (splash_ch == 'q') break;
 
-        // Parse deck
-        auto deck = parse_deck(deck_path);
-        if (deck.cards.empty()) continue;
-
-        // Build deck ID and display name
-        std::string deck_id = deck_id_from_path(deck_path, deck_root);
-        std::string dname = deck_id;
-        auto slash = dname.rfind('/');
-        if (slash != std::string::npos) dname = dname.substr(slash + 1);
-        std::replace(dname.begin(), dname.end(), '_', ' ');
-        std::replace(dname.begin(), dname.end(), '-', ' ');
-
-        // Show summary screen — timer starts after this
-        if (!show_deck_summary(dname, deck.summary, deck_id, (int)deck.cards.size(), progress)) {
-            continue; // back to browser
+        // Resume paused session
+        if (splash_ch == 'c') {
+            auto saved = DrillSession::load_session();
+            if (saved.contains("deck_path")) {
+                std::string deck_path = saved["deck_path"].get<std::string>();
+                auto deck = parse_deck(deck_path);
+                if (!deck.cards.empty()) {
+                    DrillSession session;
+                    session.restore(saved, std::move(deck.cards), &progress);
+                    int elapsed = saved.value("elapsed", 0);
+                    run_drill(session, deck_path, elapsed);
+                    continue;
+                }
+            }
+            DrillSession::clear_session();
+            continue;
         }
 
-        // Run drill
-        DrillSession session;
-        session.init(deck_id, std::move(deck.cards), &progress);
-        session.deck_name = dname;
-        run_drill(session);
+        // Normal browse flow
+        while (true) {
+            std::string deck_path = browse_decks(deck_root);
+            if (deck_path.empty()) break;
+
+            auto deck = parse_deck(deck_path);
+            if (deck.cards.empty()) continue;
+
+            std::string deck_id = deck_id_from_path(deck_path, deck_root);
+            std::string dname = deck_id;
+            auto slash = dname.rfind('/');
+            if (slash != std::string::npos) dname = dname.substr(slash + 1);
+            std::replace(dname.begin(), dname.end(), '_', ' ');
+            std::replace(dname.begin(), dname.end(), '-', ' ');
+
+            if (!show_deck_summary(dname, deck.summary, deck_id, (int)deck.cards.size(), progress)) {
+                continue;
+            }
+
+            DrillSession session;
+            session.init(deck_id, std::move(deck.cards), &progress);
+            session.deck_name = dname;
+            run_drill(session, deck_path);
+        }
     }
 
     endwin();
