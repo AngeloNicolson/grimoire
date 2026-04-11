@@ -1,7 +1,9 @@
 #include <ncurses.h>
 #include <nlohmann/json.hpp>
+#include "logos.h"
 
 #include <algorithm>
+#include <locale.h>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -675,6 +677,37 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
     }
 }
 
+// Startup splash screen — random logo variant
+static void show_splash() {
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, LOGO_COUNT - 1);
+    auto& logo = LOGOS[dist(rng)];
+
+    timeout(-1);
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    clear();
+
+    int start_y = (max_y - logo.height) / 2 - 2;
+    int start_x = (max_x - logo.width) / 2;
+    if (start_x < 0) start_x = 0;
+    if (start_y < 0) start_y = 0;
+
+    attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+    for (int i = 0; i < logo.height; i++) {
+        mvprintw(start_y + i, start_x, "%s", logo.lines[i]);
+    }
+    attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+    std::string hint = "[Press any key]";
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(start_y + logo.height + 3, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    refresh();
+    getch();
+}
+
 // Yazi-style 3-column file browser
 // Columns: parent | current | child/preview
 // Navigate with h/l to go up/down directory levels, j/k to move within a listing.
@@ -1293,6 +1326,7 @@ int main(int argc, char* argv[]) {
     std::string deck_root = expand_home(DECK_DIR);
 
     // Init ncurses
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
@@ -1302,6 +1336,8 @@ int main(int argc, char* argv[]) {
     if (has_colors()) {
         init_colors();
     }
+
+    show_splash();
 
     // Load progress
     Progress progress;

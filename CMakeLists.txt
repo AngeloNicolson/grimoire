@@ -13,13 +13,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(json)
 
-find_package(Curses REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NCURSESW REQUIRED ncursesw)
 
 add_executable(grimoire
   src/main.cpp
 )
 
-target_include_directories(grimoire PRIVATE ${CURSES_INCLUDE_DIRS})
-target_link_libraries(grimoire PRIVATE ${CURSES_LIBRARIES} nlohmann_json::nlohmann_json)
+target_include_directories(grimoire PRIVATE ${NCURSESW_INCLUDE_DIRS})
+target_link_libraries(grimoire PRIVATE ${NCURSESW_LIBRARIES} nlohmann_json::nlohmann_json)
 
 install(TARGETS grimoire DESTINATION bin)
