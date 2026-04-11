@@ -7,6 +7,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -674,143 +675,208 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
     }
 }
 
-// Collect all subjects (top-level dirs) and their decks
-struct Subject {
-    std::string name;
-    std::string path;
-    std::vector<DeckEntry> decks; // files and subdirs within
-};
+// Yazi-style 3-column file browser
+// Columns: parent | current | child/preview
+// Navigate with h/l to go up/down directory levels, j/k to move within a listing.
 
-static std::vector<Subject> collect_subjects(const std::string& root) {
-    std::vector<Subject> subjects;
-    if (!fs::exists(root)) return subjects;
-    for (auto& e : fs::directory_iterator(root)) {
-        if (!e.is_directory()) continue;
-        Subject s;
-        s.name = e.path().filename().string();
-        s.path = e.path().string();
-        // Recursively collect all .txt files under this subject
-        for (auto& f : fs::recursive_directory_iterator(e.path())) {
-            if (f.is_regular_file() && f.path().extension() == ".txt") {
-                DeckEntry d;
-                d.path = f.path().string();
-                // Show path relative to subject dir
-                std::string rel = f.path().string().substr(e.path().string().size() + 1);
-                d.name = strip_txt(rel);
-                d.is_dir = false;
-                s.decks.push_back(d);
-            }
-        }
-        std::sort(s.decks.begin(), s.decks.end(), [](const DeckEntry& a, const DeckEntry& b) {
-            return a.name < b.name;
-        });
-        if (!s.decks.empty()) {
-            subjects.push_back(s);
-        }
-    }
-    std::sort(subjects.begin(), subjects.end(), [](const Subject& a, const Subject& b) {
-        return a.name < b.name;
-    });
-    return subjects;
-}
-
-// Two-pane deck browser (ncmpcpp style)
 static std::string browse_decks(const std::string& root) {
-    auto subjects = collect_subjects(root);
-    if (subjects.empty()) return "";
+    // Navigation state: current directory path + selection index per directory
+    std::string cwd = root;
+    std::map<std::string, int> selections;  // dir path -> selected index
+    std::map<std::string, int> scrolls;     // dir path -> scroll offset
 
-    int pane = 0; // 0 = subjects (left), 1 = decks (right)
-    int subj_sel = 0, subj_scroll = 0;
-    int deck_sel = 0, deck_scroll = 0;
+    auto get_sel = [&](const std::string& dir) -> int {
+        return selections.count(dir) ? selections[dir] : 0;
+    };
+    auto get_scroll = [&](const std::string& dir) -> int {
+        return scrolls.count(dir) ? scrolls[dir] : 0;
+    };
 
     while (true) {
+        auto entries = list_dir(cwd);
+        if (entries.empty() && cwd != root) {
+            // Empty dir — go back
+            cwd = fs::path(cwd).parent_path().string();
+            continue;
+        }
+
+        int sel = get_sel(cwd);
+        if (sel >= (int)entries.size()) sel = std::max(0, (int)entries.size() - 1);
+        selections[cwd] = sel;
+
+        // Parent entries (empty if at root)
+        std::vector<DeckEntry> parent_entries;
+        std::string parent_path;
+        int parent_sel = 0;
+        if (cwd != root) {
+            parent_path = fs::path(cwd).parent_path().string();
+            parent_entries = list_dir(parent_path);
+            parent_sel = get_sel(parent_path);
+        }
+
+        // Child entries (preview of selected item)
+        std::vector<DeckEntry> child_entries;
+        if (!entries.empty() && entries[sel].is_dir) {
+            child_entries = list_dir(entries[sel].path);
+        }
+
+        // Draw
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
         clear();
 
-        // Title bar
+        // Title bar — show breadcrumb path
         attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
         std::string title = "Grimoire";
         mvprintw(0, (max_x - (int)title.size()) / 2, "%s", title.c_str());
         attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
 
-        // Layout: header line, column headers, divider, list area, footer
+        // Breadcrumb
+        std::string crumb;
+        if (cwd.size() > root.size()) {
+            crumb = cwd.substr(root.size() + 1);
+            std::replace(crumb.begin(), crumb.end(), '_', ' ');
+        }
+        if (!crumb.empty()) {
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(0, 1, "%s", crumb.c_str());
+            attroff(COLOR_PAIR(CLR_DIM));
+        }
+
         int header_y = 1;
         draw_hline_full(header_y, 0, max_x);
 
-        int col_header_y = 2;
-        int list_start = 3;
+        int list_start = 2;
         int footer_y = max_y - 1;
         int list_h = footer_y - list_start;
         if (list_h < 1) list_h = 1;
 
-        // Column widths
-        int left_w = max_x / 3;
-        int right_w = max_x - left_w - 1; // -1 for divider
-
-        // Column headers
-        attron(COLOR_PAIR(CLR_COLHEAD) | A_BOLD);
-        mvprintw(col_header_y, 1, "Subjects");
-        mvprintw(col_header_y, left_w + 2, "Decks");
-        attroff(COLOR_PAIR(CLR_COLHEAD) | A_BOLD);
-
-        // Vertical divider
-        draw_vline(col_header_y, left_w, list_h + 1);
-
-        // Horizontal line under column headers
-        draw_hline_full(list_start - 1, 0, max_x);
-
-        // --- Left pane: subjects ---
-        int subj_visible = list_h;
-        if (subj_sel < subj_scroll) subj_scroll = subj_sel;
-        if (subj_sel >= subj_scroll + subj_visible) subj_scroll = subj_sel - subj_visible + 1;
-
-        for (int i = 0; i < subj_visible && (i + subj_scroll) < (int)subjects.size(); i++) {
-            int idx = i + subj_scroll;
-            int y = list_start + i;
-            std::string display = subjects[idx].name;
-            if ((int)display.size() > left_w - 2) display = display.substr(0, left_w - 2);
-
-            if (idx == subj_sel) {
-                if (pane == 0) {
-                    attron(COLOR_PAIR(CLR_HIGHLIGHT));
-                    mvprintw(y, 1, "%-*s", left_w - 2, display.c_str());
-                    attroff(COLOR_PAIR(CLR_HIGHLIGHT));
-                } else {
-                    attron(COLOR_PAIR(CLR_DIR) | A_BOLD);
-                    mvprintw(y, 1, "%s", display.c_str());
-                    attroff(COLOR_PAIR(CLR_DIR) | A_BOLD);
-                }
-            } else {
-                mvprintw(y, 1, "%s", display.c_str());
-            }
+        // Always 3 columns: col0 | col1 | col2
+        // At root: active=col0, preview=col1, col2 = deeper preview
+        // Depth 1: parent=col0, active=col1, preview=col2
+        // Depth 2+: grandparent shifts out, parent=col0, active=col1, preview=col2
+        int depth = 0;
+        if (cwd.size() > root.size()) {
+            std::string rel = cwd.substr(root.size() + 1);
+            for (char c : rel) if (c == '/') depth++;
+            depth++;
         }
 
-        // --- Right pane: decks for selected subject ---
-        auto& decks = subjects[subj_sel].decks;
-        int deck_visible = list_h;
-        if (deck_sel < deck_scroll) deck_scroll = deck_sel;
-        if (deck_sel >= deck_scroll + deck_visible) deck_scroll = deck_sel - deck_visible + 1;
+        // Column geometry — always 3
+        int col_w = max_x / 3;
+        int col0_x = 0, col0_w = col_w;
+        int col1_x = col_w + 1, col1_w = col_w;
+        int col2_x = col_w * 2 + 2, col2_w = max_x - col2_x;
 
-        for (int i = 0; i < deck_visible && (i + deck_scroll) < (int)decks.size(); i++) {
-            int idx = i + deck_scroll;
-            int y = list_start + i;
-            std::string display = decks[idx].name;
-            if ((int)display.size() > right_w - 2) display = display.substr(0, right_w - 2);
+        // Vertical dividers — always 2
+        draw_vline(list_start, col_w, list_h);
+        draw_vline(list_start, col_w * 2 + 1, list_h);
 
-            if (pane == 1 && idx == deck_sel) {
-                attron(COLOR_PAIR(CLR_HIGHLIGHT));
-                mvprintw(y, left_w + 2, "%-*s", right_w - 2, display.c_str());
-                attroff(COLOR_PAIR(CLR_HIGHLIGHT));
-            } else {
-                mvprintw(y, left_w + 2, "%s", display.c_str());
+        // Assign columns based on depth
+        int active_x, active_w, preview_x, preview_w;
+        int parent_col_x = -1, parent_col_w = 0;
+
+        if (depth == 0) {
+            // Root: active in col0, preview in col1, col2 for deeper preview
+            active_x = col0_x; active_w = col0_w;
+            preview_x = col1_x; preview_w = col1_w;
+        } else {
+            // Depth 1+: parent in col0, active in col1, preview in col2
+            parent_col_x = col0_x; parent_col_w = col0_w;
+            active_x = col1_x; active_w = col1_w;
+            preview_x = col2_x; preview_w = col2_w;
+        }
+
+        // Helper to draw a column of entries
+        auto draw_column = [&](const std::vector<DeckEntry>& items, int col_x, int w,
+                               int selected, int& scroll, bool is_active) {
+            int visible = list_h;
+            if (selected >= 0) {
+                if (selected < scroll) scroll = selected;
+                if (selected >= scroll + visible) scroll = selected - visible + 1;
             }
+
+            for (int i = 0; i < visible && (i + scroll) < (int)items.size(); i++) {
+                int idx = i + scroll;
+                int y = list_start + i;
+                std::string display = strip_txt(items[idx].name);
+                std::replace(display.begin(), display.end(), '_', ' ');
+                std::replace(display.begin(), display.end(), '-', ' ');
+                if ((int)display.size() > w - 2) display = display.substr(0, w - 2);
+
+                if (idx == selected && is_active) {
+                    attron(COLOR_PAIR(CLR_HIGHLIGHT));
+                    mvprintw(y, col_x + 1, "%-*s", w - 2, display.c_str());
+                    attroff(COLOR_PAIR(CLR_HIGHLIGHT));
+                } else if (idx == selected && !is_active) {
+                    attron(COLOR_PAIR(CLR_HIGHLIGHT) | A_DIM);
+                    mvprintw(y, col_x + 1, "%-*s", w - 2, display.c_str());
+                    attroff(COLOR_PAIR(CLR_HIGHLIGHT) | A_DIM);
+                } else if (items[idx].is_dir) {
+                    attron(COLOR_PAIR(CLR_DIR));
+                    mvprintw(y, col_x + 1, "%s", display.c_str());
+                    attroff(COLOR_PAIR(CLR_DIR));
+                } else {
+                    mvprintw(y, col_x + 1, "%s", display.c_str());
+                }
+            }
+        };
+
+        // Draw parent column (only when depth > 0)
+        if (parent_col_x >= 0 && !parent_entries.empty()) {
+            int ps = get_scroll(parent_path);
+            draw_column(parent_entries, parent_col_x, parent_col_w, parent_sel, ps, false);
+            scrolls[parent_path] = ps;
+        }
+
+        // Draw active column
+        {
+            int cs = get_scroll(cwd);
+            draw_column(entries, active_x, active_w, sel, cs, true);
+            scrolls[cwd] = cs;
+        }
+
+        // Draw preview column
+        auto draw_file_preview = [&](const std::string& path, int px, int pw) {
+            auto preview_deck = parse_deck(path);
+            int n = (int)preview_deck.cards.size();
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(list_start, px + 1, "%d card%s", n, n == 1 ? "" : "s");
+            int preview_y = list_start + 2;
+            for (int i = 0; i < std::min(n, list_h - 2); i++) {
+                std::string q = preview_deck.cards[i].question;
+                if ((int)q.size() > pw - 2) q = q.substr(0, pw - 5) + "...";
+                mvprintw(preview_y + i, px + 1, "%s", q.c_str());
+            }
+            attroff(COLOR_PAIR(CLR_DIM));
+        };
+
+        if (!child_entries.empty()) {
+            int dummy_scroll = 0;
+            draw_column(child_entries, preview_x, preview_w, -1, dummy_scroll, false);
+
+            // At root: also show col2 as deeper preview of first child item
+            if (depth == 0 && !child_entries.empty()) {
+                // Find first item in child to preview in col2
+                auto& first_child = child_entries[0];
+                if (first_child.is_dir) {
+                    auto grandchild = list_dir(first_child.path);
+                    if (!grandchild.empty()) {
+                        int gs = 0;
+                        draw_column(grandchild, col2_x, col2_w, -1, gs, false);
+                    }
+                } else {
+                    draw_file_preview(first_child.path, col2_x, col2_w);
+                }
+            }
+        } else if (!entries.empty() && !entries[sel].is_dir) {
+            draw_file_preview(entries[sel].path, preview_x, preview_w);
         }
 
         // Footer
         draw_hline_full(footer_y - 1, 0, max_x);
         attron(COLOR_PAIR(CLR_DIM));
-        mvprintw(footer_y, 1, "[j/k] navigate  [h/l] switch pane  [Enter] select  [q] quit");
+        mvprintw(footer_y, 1, "[j/k] navigate  [h] back  [l/Enter] open  [q] quit");
         attroff(COLOR_PAIR(CLR_DIM));
 
         refresh();
@@ -819,38 +885,29 @@ static std::string browse_decks(const std::string& root) {
         if (ch == 'q' || ch == 27) return "";
 
         if (ch == 'j' || ch == KEY_DOWN) {
-            if (pane == 0) {
-                if (subj_sel < (int)subjects.size() - 1) {
-                    subj_sel++;
-                    deck_sel = 0;
-                    deck_scroll = 0;
-                }
-            } else {
-                if (deck_sel < (int)decks.size() - 1) deck_sel++;
+            if (sel < (int)entries.size() - 1) {
+                selections[cwd] = sel + 1;
             }
         }
         if (ch == 'k' || ch == KEY_UP) {
-            if (pane == 0) {
-                if (subj_sel > 0) {
-                    subj_sel--;
-                    deck_sel = 0;
-                    deck_scroll = 0;
-                }
-            } else {
-                if (deck_sel > 0) deck_sel--;
+            if (sel > 0) {
+                selections[cwd] = sel - 1;
             }
         }
-        if (ch == 'l' || ch == KEY_RIGHT || ch == '\t') {
-            if (pane == 0 && !decks.empty()) pane = 1;
+        // Enter directory or select deck
+        if (ch == 'l' || ch == KEY_RIGHT || ch == '\n' || ch == KEY_ENTER) {
+            if (!entries.empty()) {
+                if (entries[sel].is_dir) {
+                    cwd = entries[sel].path;
+                } else {
+                    return entries[sel].path;
+                }
+            }
         }
+        // Go up
         if (ch == 'h' || ch == KEY_LEFT) {
-            if (pane == 1) pane = 0;
-        }
-        if (ch == '\n' || ch == KEY_ENTER) {
-            if (pane == 0 && !decks.empty()) {
-                pane = 1;
-            } else if (pane == 1 && !decks.empty()) {
-                return decks[deck_sel].path;
+            if (cwd != root) {
+                cwd = fs::path(cwd).parent_path().string();
             }
         }
     }
