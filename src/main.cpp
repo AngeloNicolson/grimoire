@@ -1279,15 +1279,25 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
-            int bar_w_q = max_x;
-            int filled_q = (total_cards_q > 0) ? (mastered * bar_w_q) / total_cards_q : 0;
-            move(max_y - 1, 0);
-            attron(COLOR_PAIR(CLR_CORRECT));
-            for (int i = 0; i < filled_q; i++) addch(ACS_BLOCK);
-            attroff(COLOR_PAIR(CLR_CORRECT));
-            attron(COLOR_PAIR(CLR_DIM));
-            for (int i = filled_q; i < bar_w_q; i++) addch(ACS_HLINE);
-            attroff(COLOR_PAIR(CLR_DIM));
+            if (total_cards_q > 0) {
+                int n = total_cards_q;
+                int gaps = n - 1;
+                int usable = max_x - gaps;
+                int base_w = usable / n;
+                int extra = usable % n;
+                if (base_w < 1) { base_w = 1; extra = 0; }
+                move(max_y - 1, 0);
+                for (int i = 0; i < n; i++) {
+                    int start_extra = (n - extra) / 2;
+                    int w = base_w + (i >= start_extra && i < start_extra + extra ? 1 : 0);
+                    if (i < mastered) attron(COLOR_PAIR(CLR_CORRECT));
+                    else attron(COLOR_PAIR(CLR_DIM));
+                    for (int j = 0; j < w; j++) addch(ACS_HLINE);
+                    if (i < mastered) attroff(COLOR_PAIR(CLR_CORRECT));
+                    else attroff(COLOR_PAIR(CLR_DIM));
+                    if (i < n - 1) addch(' ');
+                }
+            }
 
             refresh();
 
@@ -1392,15 +1402,19 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_a = (int)session.cards.size();
-            int bar_w_a = max_x;
-            int filled_a = (total_cards_a > 0) ? (mastered * bar_w_a) / total_cards_a : 0;
-            move(max_y - 1, 0);
-            attron(COLOR_PAIR(CLR_CORRECT));
-            for (int i = 0; i < filled_a; i++) addch(ACS_BLOCK);
-            attroff(COLOR_PAIR(CLR_CORRECT));
-            attron(COLOR_PAIR(CLR_DIM));
-            for (int i = filled_a; i < bar_w_a; i++) addch(ACS_HLINE);
-            attroff(COLOR_PAIR(CLR_DIM));
+            if (total_cards_a > 0) {
+                move(max_y - 1, 0);
+                for (int i = 0; i < total_cards_a; i++) {
+                    int seg_start = (i * max_x) / total_cards_a;
+                    int seg_end = ((i + 1) * max_x) / total_cards_a;
+                    int seg_w = seg_end - seg_start;
+                    if (i < mastered) attron(COLOR_PAIR(CLR_CORRECT));
+                    else attron(COLOR_PAIR(CLR_DIM));
+                    for (int j = 0; j < seg_w; j++) addch(ACS_HLINE);
+                    if (i < mastered) attroff(COLOR_PAIR(CLR_CORRECT));
+                    else attroff(COLOR_PAIR(CLR_DIM));
+                }
+            }
 
             refresh();
 
