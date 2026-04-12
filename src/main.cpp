@@ -1274,10 +1274,19 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 y++;
             }
 
-            // Footer
-            draw_hline_full(max_y - 2, 0, max_x);
+            // Hints then progress bar at very bottom
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 1, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            int total_cards_q = (int)session.cards.size();
+            int bar_w_q = max_x;
+            int filled_q = (total_cards_q > 0) ? (mastered * bar_w_q) / total_cards_q : 0;
+            move(max_y - 1, 0);
+            attron(COLOR_PAIR(CLR_CORRECT));
+            for (int i = 0; i < filled_q; i++) addch(ACS_BLOCK);
+            attroff(COLOR_PAIR(CLR_CORRECT));
+            attron(COLOR_PAIR(CLR_DIM));
+            for (int i = filled_q; i < bar_w_q; i++) addch(ACS_HLINE);
             attroff(COLOR_PAIR(CLR_DIM));
 
             refresh();
@@ -1372,16 +1381,25 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             }
             attroff(A_BOLD);
 
-            // Footer
-            draw_hline_full(max_y - 3, 0, max_x);
+            // Hints inline then progress bar at very bottom
             attron(COLOR_PAIR(CLR_CORRECT));
-            mvprintw(max_y - 2, 1, "[y] Yes (%d/%d)", streak + 1, card_target);
+            mvprintw(max_y - 3, 1, "[y] Yes (%d/%d)", streak + 1, card_target);
             attroff(COLOR_PAIR(CLR_CORRECT));
             attron(COLOR_PAIR(CLR_WRONG));
-            mvprintw(max_y - 2, 20, "[n] No (drop)");
+            mvprintw(max_y - 3, 20, "[n] No (drop)");
             attroff(COLOR_PAIR(CLR_WRONG));
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 1, 1, "[a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            int total_cards_a = (int)session.cards.size();
+            int bar_w_a = max_x;
+            int filled_a = (total_cards_a > 0) ? (mastered * bar_w_a) / total_cards_a : 0;
+            move(max_y - 1, 0);
+            attron(COLOR_PAIR(CLR_CORRECT));
+            for (int i = 0; i < filled_a; i++) addch(ACS_BLOCK);
+            attroff(COLOR_PAIR(CLR_CORRECT));
+            attron(COLOR_PAIR(CLR_DIM));
+            for (int i = filled_a; i < bar_w_a; i++) addch(ACS_HLINE);
             attroff(COLOR_PAIR(CLR_DIM));
 
             refresh();
