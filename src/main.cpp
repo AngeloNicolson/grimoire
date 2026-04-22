@@ -1,19 +1,19 @@
+#include "logos.h"
 #include <ncurses.h>
 #include <nlohmann/json.hpp>
-#include "logos.h"
 
 #include <algorithm>
-#include <locale.h>
 #include <array>
 #include <cstdlib>
 #include <cstring>
-#include <unistd.h>
 #include <filesystem>
-#include <map>
 #include <fstream>
+#include <locale.h>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -25,7 +25,8 @@ static const std::string DECK_DIR = "~/knowledge_vault/Study-Vault/Grimoire";
 static const std::string DATA_FILE = "~/.local/share/grimoire/progress.json";
 static const std::string SESSION_FILE = "~/.local/share/grimoire/session.json";
 
-static std::string expand_home(const std::string& path) {
+static std::string expand_home(const std::string& path)
+{
     if (path.empty() || path[0] != '~') return path;
     const char* home = std::getenv("HOME");
     if (!home) return path;
@@ -34,42 +35,51 @@ static std::string expand_home(const std::string& path) {
 
 // --- Card / Deck ---
 
-struct Card {
+struct Card
+{
     std::string question;
     std::string answer;
 };
 
-struct DeckEntry {
+struct DeckEntry
+{
     std::string name;
     std::string path;
     bool is_dir;
 };
 
-struct Deck {
+struct Deck
+{
     std::string summary;
     std::vector<Card> cards;
 };
 
-static Deck parse_deck(const std::string& path) {
+static Deck parse_deck(const std::string& path)
+{
     Deck deck;
     std::ifstream file(path);
     std::string line;
     bool past_separator = false;
-    while (std::getline(file, line)) {
+    while (std::getline(file, line))
+    {
         // Check for --- separator (summary delimiter)
-        if (!past_separator) {
+        if (!past_separator)
+        {
             std::string trimmed = line;
             while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
                 trimmed.pop_back();
-            if (trimmed == "---") {
+            if (trimmed == "---")
+            {
                 past_separator = true;
                 continue;
             }
         }
         auto sep = line.find(" :: ");
-        if (sep == std::string::npos) {
+        if (sep == std::string::npos)
+        {
             // Before any cards and no separator yet — accumulate as summary
-            if (!past_separator && deck.cards.empty() && !line.empty()) {
+            if (!past_separator && deck.cards.empty() && !line.empty())
+            {
                 if (!deck.summary.empty()) deck.summary += "\n";
                 deck.summary += line;
             }
@@ -84,50 +94,59 @@ static Deck parse_deck(const std::string& path) {
     return deck;
 }
 
-static std::vector<DeckEntry> list_dir(const std::string& dir) {
+static std::vector<DeckEntry> list_dir(const std::string& dir)
+{
     std::vector<DeckEntry> entries;
     if (!fs::exists(dir)) return entries;
-    for (auto& e : fs::directory_iterator(dir)) {
+    for (auto& e : fs::directory_iterator(dir))
+    {
         DeckEntry d;
         d.path = e.path().string();
         d.name = e.path().filename().string();
         d.is_dir = e.is_directory();
-        if (d.is_dir || e.path().extension() == ".txt") {
-            entries.push_back(d);
-        }
+        if (d.is_dir || e.path().extension() == ".txt") { entries.push_back(d); }
     }
-    std::sort(entries.begin(), entries.end(), [](const DeckEntry& a, const DeckEntry& b) {
-        if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
-        return a.name < b.name;
-    });
+    std::sort(entries.begin(), entries.end(),
+              [](const DeckEntry& a, const DeckEntry& b)
+              {
+                  if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
+                  return a.name < b.name;
+              });
     return entries;
 }
 
 // --- Progress ---
 
-struct Progress {
+struct Progress
+{
     json drill_mastery;
     json deck_stats;
 
-    void load() {
+    void load()
+    {
         std::string path = expand_home(DATA_FILE);
         std::ifstream file(path);
-        if (!file.is_open()) {
+        if (!file.is_open())
+        {
             drill_mastery = json::object();
             deck_stats = json::object();
             return;
         }
-        try {
+        try
+        {
             json data = json::parse(file);
             drill_mastery = data.value("drill_mastery", json::object());
             deck_stats = data.value("deck_stats", json::object());
-        } catch (...) {
+        }
+        catch (...)
+        {
             drill_mastery = json::object();
             deck_stats = json::object();
         }
     }
 
-    void save() {
+    void save()
+    {
         std::string path = expand_home(DATA_FILE);
         std::string dir = fs::path(path).parent_path().string();
         fs::create_directories(dir);
@@ -138,15 +157,15 @@ struct Progress {
         file << data.dump(2);
     }
 
-    int get_stage(const std::string& deck_id, int card_idx) {
+    int get_stage(const std::string& deck_id, int card_idx)
+    {
         std::string key = deck_id + ":" + std::to_string(card_idx);
-        if (drill_mastery.contains(key)) {
-            return drill_mastery[key].get<int>();
-        }
+        if (drill_mastery.contains(key)) { return drill_mastery[key].get<int>(); }
         return 0;
     }
 
-    void set_stage(const std::string& deck_id, int card_idx, int stage) {
+    void set_stage(const std::string& deck_id, int card_idx, int stage)
+    {
         std::string key = deck_id + ":" + std::to_string(card_idx);
         drill_mastery[key] = stage;
     }
@@ -154,8 +173,10 @@ struct Progress {
 
 // --- Drill Logic ---
 
-static int stage_target(int stage) {
-    switch (stage) {
+static int stage_target(int stage)
+{
+    switch (stage)
+    {
         case 0: return 3;
         case 1: return 2;
         case 2: return 1;
@@ -163,8 +184,10 @@ static int stage_target(int stage) {
     }
 }
 
-static const char* stage_label(int stage) {
-    switch (stage) {
+static const char* stage_label(int stage)
+{
+    switch (stage)
+    {
         case 0: return "New";
         case 1: return "Familiar";
         case 2: return "Strong";
@@ -172,7 +195,8 @@ static const char* stage_label(int stage) {
     }
 }
 
-struct DrillSession {
+struct DrillSession
+{
     std::string deck_id;
     std::string deck_name; // display name
     std::vector<Card> cards;
@@ -184,7 +208,8 @@ struct DrillSession {
     std::vector<int> targets;
     int round_num = 1;
 
-    void init(const std::string& id, std::vector<Card> c, Progress* p) {
+    void init(const std::string& id, std::vector<Card> c, Progress* p)
+    {
         deck_id = id;
         cards = std::move(c);
         progress = p;
@@ -196,7 +221,8 @@ struct DrillSession {
         targets.resize(n);
 
         round.clear();
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n; i++)
+        {
             int stage = progress->get_stage(deck_id, i);
             targets[i] = stage_target(stage);
             round.push_back(i);
@@ -204,12 +230,14 @@ struct DrillSession {
         shuffle_round();
     }
 
-    void shuffle_round() {
+    void shuffle_round()
+    {
         static std::mt19937 rng(std::random_device{}());
         std::shuffle(round.begin(), round.end(), rng);
     }
 
-    bool next_round() {
+    bool next_round()
+    {
         if (missed.empty()) return false;
         round = std::move(missed);
         missed.clear();
@@ -218,27 +246,34 @@ struct DrillSession {
         return true;
     }
 
-    int mastered_count() {
+    int mastered_count()
+    {
         int count = 0;
-        for (int i = 0; i < (int)cards.size(); i++) {
+        for (int i = 0; i < (int)cards.size(); i++)
+        {
             if (streaks[i] >= targets[i]) count++;
         }
         return count;
     }
 
-    void mark_correct(int idx) {
+    void mark_correct(int idx)
+    {
         streaks[idx]++;
-        if (streaks[idx] >= targets[idx]) {
+        if (streaks[idx] >= targets[idx])
+        {
             int stage = progress->get_stage(deck_id, idx);
             int new_stage = std::min(stage + 1, 2);
             progress->set_stage(deck_id, idx, new_stage);
             progress->save();
-        } else {
+        }
+        else
+        {
             missed.push_back(idx);
         }
     }
 
-    void mark_wrong(int idx) {
+    void mark_wrong(int idx)
+    {
         streaks[idx] = 0;
         int stage = progress->get_stage(deck_id, idx);
         int new_stage = std::max(stage - 1, 0);
@@ -249,7 +284,8 @@ struct DrillSession {
     }
 
     // Save paused session to disk
-    void save_session(const std::string& path, int elapsed) {
+    void save_session(const std::string& path, int elapsed)
+    {
         std::string fpath = expand_home(SESSION_FILE);
         std::string dir = fs::path(fpath).parent_path().string();
         fs::create_directories(dir);
@@ -268,7 +304,8 @@ struct DrillSession {
     }
 
     // Restore session state from saved data
-    void restore(const json& j, std::vector<Card> c, Progress* p) {
+    void restore(const json& j, std::vector<Card> c, Progress* p)
+    {
         deck_id = j["deck_id"].get<std::string>();
         deck_name = j["deck_name"].get<std::string>();
         cards = std::move(c);
@@ -280,18 +317,23 @@ struct DrillSession {
         round_num = j["round_num"].get<int>();
     }
 
-    static void clear_session() {
+    static void clear_session()
+    {
         std::string fpath = expand_home(SESSION_FILE);
         if (fs::exists(fpath)) fs::remove(fpath);
     }
 
-    static json load_session() {
+    static json load_session()
+    {
         std::string fpath = expand_home(SESSION_FILE);
         std::ifstream file(fpath);
         if (!file.is_open()) return json();
-        try {
+        try
+        {
             return json::parse(file);
-        } catch (...) {
+        }
+        catch (...)
+        {
             return json();
         }
     }
@@ -299,18 +341,22 @@ struct DrillSession {
 
 // --- TUI ---
 
-static std::vector<std::string> wrap_text(const std::string& text, int width) {
+static std::vector<std::string> wrap_text(const std::string& text, int width)
+{
     std::vector<std::string> lines;
     std::istringstream stream(text);
     std::string word;
     std::string line;
-    while (stream >> word) {
-        if (line.empty()) {
-            line = word;
-        } else if ((int)(line.size() + 1 + word.size()) > width) {
+    while (stream >> word)
+    {
+        if (line.empty()) { line = word; }
+        else if ((int)(line.size() + 1 + word.size()) > width)
+        {
             lines.push_back(line);
             line = word;
-        } else {
+        }
+        else
+        {
             line += " " + word;
         }
     }
@@ -318,13 +364,15 @@ static std::vector<std::string> wrap_text(const std::string& text, int width) {
     return lines;
 }
 
-static std::string strip_txt(const std::string& name) {
+static std::string strip_txt(const std::string& name)
+{
     if (name.size() > 4 && name.substr(name.size() - 4) == ".txt")
         return name.substr(0, name.size() - 4);
     return name;
 }
 
-enum Color {
+enum Color
+{
     CLR_DEFAULT = 1,
     CLR_HEADER,
     CLR_STAGE_NEW,
@@ -340,7 +388,8 @@ enum Color {
     CLR_COLHEAD,
 };
 
-static void init_colors() {
+static void init_colors()
+{
     start_color();
     use_default_colors();
     init_pair(CLR_DEFAULT, -1, -1);
@@ -358,8 +407,10 @@ static void init_colors() {
     init_pair(CLR_COLHEAD, COLOR_YELLOW, -1);
 }
 
-static int stage_color(int stage) {
-    switch (stage) {
+static int stage_color(int stage)
+{
+    switch (stage)
+    {
         case 0: return CLR_STAGE_NEW;
         case 1: return CLR_STAGE_FAMILIAR;
         case 2: return CLR_STAGE_STRONG;
@@ -368,23 +419,27 @@ static int stage_color(int stage) {
 }
 
 // Draw a vertical line
-static void draw_vline(int y, int x, int h) {
+static void draw_vline(int y, int x, int h)
+{
     attron(COLOR_PAIR(CLR_BORDER));
-    for (int i = 0; i < h; i++) {
+    for (int i = 0; i < h; i++)
+    {
         mvaddch(y + i, x, ACS_VLINE);
     }
     attroff(COLOR_PAIR(CLR_BORDER));
 }
 
 // Draw a full-width horizontal line
-static void draw_hline_full(int y, int x, int w) {
+static void draw_hline_full(int y, int x, int w)
+{
     attron(COLOR_PAIR(CLR_BORDER));
     mvhline(y, x, ACS_HLINE, w);
     attroff(COLOR_PAIR(CLR_BORDER));
 }
 
 // Draw a box with ACS characters
-static void draw_box(int y, int x, int h, int w) {
+static void draw_box(int y, int x, int h, int w)
+{
     attron(COLOR_PAIR(CLR_BORDER));
     mvhline(y, x + 1, ACS_HLINE, w - 2);
     mvhline(y + h - 1, x + 1, ACS_HLINE, w - 2);
@@ -401,27 +456,42 @@ static void draw_box(int y, int x, int h, int w) {
 
 static const std::string OLLAMA_URL = "http://localhost:11434";
 
-static std::string shell_escape(const std::string& s) {
+static std::string shell_escape(const std::string& s)
+{
     std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
+    for (char c : s)
+    {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
     }
     out += "'";
     return out;
 }
 
-static std::string query_ollama(const std::string& model, const Card& card,
-                                 const std::string& deck, const std::string& user_question) {
+static std::string query_ollama(const std::string& model, const Card& card, const std::string& deck,
+                                const std::string& user_question)
+{
     std::string system_prompt =
-        "You are a helpful study assistant. The user is studying flashcards and needs help understanding the current card.\n\n"
+        "You are a helpful study assistant. The user is studying flashcards and needs help "
+        "understanding the current card.\n\n"
         "Current flashcard:\n"
-        "- Question: " + card.question + "\n"
-        "- Answer: " + card.answer + "\n"
-        "- Deck: " + deck + "\n\n"
-        "Keep your responses concise and focused on helping the user understand this specific card. "
-        "Explain concepts, provide mnemonics, give examples, or clarify anything about this card.\n\n"
-        "IMPORTANT: Output plain text only. Do NOT use markdown formatting like **bold**, *italic*, headers (#), or bullet points (-/*). Just use plain sentences and paragraphs.";
+        "- Question: " +
+        card.question +
+        "\n"
+        "- Answer: " +
+        card.answer +
+        "\n"
+        "- Deck: " +
+        deck +
+        "\n\n"
+        "Keep your responses concise and focused on helping the user understand this specific "
+        "card. "
+        "Explain concepts, provide mnemonics, give examples, or clarify anything about this "
+        "card.\n\n"
+        "IMPORTANT: Output plain text only. Do NOT use markdown formatting like **bold**, "
+        "*italic*, headers (#), or bullet points (-/*). Just use plain sentences and paragraphs.";
 
     json payload;
     payload["model"] = model;
@@ -429,35 +499,44 @@ static std::string query_ollama(const std::string& model, const Card& card,
     payload["system"] = system_prompt;
     payload["stream"] = false;
 
-    std::string cmd = "curl -s -X POST " + OLLAMA_URL + "/api/generate "
+    std::string cmd = "curl -s -X POST " + OLLAMA_URL +
+                      "/api/generate "
                       "-H 'Content-Type: application/json' "
-                      "-d " + shell_escape(payload.dump()) + " 2>/dev/null";
+                      "-d " +
+                      shell_escape(payload.dump()) + " 2>/dev/null";
 
     std::string result;
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return "Error: failed to run curl";
     std::array<char, 4096> buf;
-    while (fgets(buf.data(), buf.size(), pipe)) {
+    while (fgets(buf.data(), buf.size(), pipe))
+    {
         result += buf.data();
     }
     pclose(pipe);
 
     if (result.empty()) return "Error: empty response from Ollama. Is the model running?";
 
-    try {
+    try
+    {
         auto resp = json::parse(result);
         if (resp.contains("response")) return resp["response"].get<std::string>();
         if (resp.contains("error")) return "Ollama error: " + resp["error"].get<std::string>();
-    } catch (...) {}
+    }
+    catch (...)
+    {
+    }
     return "Error: could not parse Ollama response";
 }
 
-static std::string get_loaded_model() {
+static std::string get_loaded_model()
+{
     FILE* pipe = popen("ollama ps 2>/dev/null | tail -n +2 | head -n 1 | awk '{print $1}'", "r");
     if (!pipe) return "";
     char buf[256];
     std::string model;
-    if (fgets(buf, sizeof(buf), pipe)) {
+    if (fgets(buf, sizeof(buf), pipe))
+    {
         model = buf;
         while (!model.empty() && (model.back() == '\n' || model.back() == ' '))
             model.pop_back();
@@ -466,44 +545,45 @@ static std::string get_loaded_model() {
     return model;
 }
 
-static std::string get_input(int y, int x, int max_w) {
+static std::string get_input(int y, int x, int max_w)
+{
     std::string input;
     curs_set(1);
     timeout(-1);
-    while (true) {
+    while (true)
+    {
         mvhline(y, x, ' ', max_w);
         mvprintw(y, x, "> %s", input.c_str());
         refresh();
         int ch = getch();
         if (ch == '\n' || ch == KEY_ENTER) break;
-        if (ch == 27) { input.clear(); break; }
-        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty()) {
-            input.pop_back();
-        } else if (ch >= 32 && ch < 127 && (int)input.size() < max_w - 4) {
-            input += (char)ch;
+        if (ch == 27)
+        {
+            input.clear();
+            break;
         }
+        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty()) { input.pop_back(); }
+        else if (ch >= 32 && ch < 127 && (int)input.size() < max_w - 4) { input += (char)ch; }
     }
     curs_set(0);
     return input;
 }
 
 // Check if ollama service is running
-static bool ollama_is_running() {
-    return system("systemctl is-active --quiet ollama") == 0;
-}
+static bool ollama_is_running() { return system("systemctl is-active --quiet ollama") == 0; }
 
 // Start ollama service
-static void start_ollama() {
-    system("systemctl start ollama >/dev/null 2>&1");
-}
+static void start_ollama() { system("systemctl start ollama >/dev/null 2>&1"); }
 
 // Get list of available models
-static std::vector<std::string> get_available_models() {
+static std::vector<std::string> get_available_models()
+{
     std::vector<std::string> models;
     FILE* pipe = popen("ollama list 2>/dev/null | tail -n +2 | awk '{print $1}'", "r");
     if (!pipe) return models;
     char buf[256];
-    while (fgets(buf, sizeof(buf), pipe)) {
+    while (fgets(buf, sizeof(buf), pipe))
+    {
         std::string m = buf;
         while (!m.empty() && (m.back() == '\n' || m.back() == ' '))
             m.pop_back();
@@ -514,26 +594,31 @@ static std::vector<std::string> get_available_models() {
 }
 
 // Load a model by sending a minimal request
-static void load_model(const std::string& model) {
+static void load_model(const std::string& model)
+{
     json payload;
     payload["model"] = model;
     payload["prompt"] = "hi";
     payload["stream"] = false;
-    std::string cmd = "curl -s -X POST " + OLLAMA_URL + "/api/generate "
+    std::string cmd = "curl -s -X POST " + OLLAMA_URL +
+                      "/api/generate "
                       "-H 'Content-Type: application/json' "
-                      "-d " + shell_escape(payload.dump()) + " >/dev/null 2>&1";
+                      "-d " +
+                      shell_escape(payload.dump()) + " >/dev/null 2>&1";
     system(cmd.c_str());
 }
 
 // In-app model picker, returns selected model or empty string
-static std::string pick_model() {
+static std::string pick_model()
+{
     auto models = get_available_models();
     if (models.empty()) return "";
 
     int selected = 0;
     int scroll = 0;
 
-    while (true) {
+    while (true)
+    {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
         clear();
@@ -552,14 +637,18 @@ static std::string pick_model() {
         if (selected < scroll) scroll = selected;
         if (selected >= scroll + visible) scroll = selected - visible + 1;
 
-        for (int i = 0; i < visible && (i + scroll) < (int)models.size(); i++) {
+        for (int i = 0; i < visible && (i + scroll) < (int)models.size(); i++)
+        {
             int idx = i + scroll;
             int y = list_y + i;
-            if (idx == selected) {
+            if (idx == selected)
+            {
                 attron(COLOR_PAIR(CLR_HIGHLIGHT));
                 mvprintw(y, 3, "%-*s", max_x - 6, models[idx].c_str());
                 attroff(COLOR_PAIR(CLR_HIGHLIGHT));
-            } else {
+            }
+            else
+            {
                 mvprintw(y, 3, "%s", models[idx].c_str());
             }
         }
@@ -574,18 +663,26 @@ static std::string pick_model() {
         timeout(-1);
         int ch = getch();
         if (ch == 'q' || ch == 27) return "";
-        if (ch == 'j' || ch == KEY_DOWN) { if (selected < (int)models.size() - 1) selected++; }
-        if (ch == 'k' || ch == KEY_UP) { if (selected > 0) selected--; }
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            if (selected < (int)models.size() - 1) selected++;
+        }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (selected > 0) selected--;
+        }
         if (ch == '\n' || ch == KEY_ENTER) return models[selected];
     }
 }
 
 // Ensure ollama is ready with a loaded model
-static std::string ensure_ollama_ready() {
+static std::string ensure_ollama_ready()
+{
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
 
-    if (!ollama_is_running()) {
+    if (!ollama_is_running())
+    {
         clear();
         attron(COLOR_PAIR(CLR_DIM));
         mvprintw(max_y / 2, (max_x - 22) / 2, "Starting Ollama...");
@@ -593,7 +690,8 @@ static std::string ensure_ollama_ready() {
         refresh();
         start_ollama();
         // Wait for it to be ready
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 10; i++)
+        {
             usleep(500000);
             if (ollama_is_running()) break;
         }
@@ -619,7 +717,8 @@ static std::string ensure_ollama_ready() {
     return model;
 }
 
-static void show_ai_assistant(const Card& card, const std::string& deck) {
+static void show_ai_assistant(const Card& card, const std::string& deck)
+{
     std::string model = ensure_ollama_ready();
     if (model.empty()) return;
 
@@ -627,7 +726,8 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
     std::vector<std::string> response_lines;
     std::string last_question;
 
-    while (true) {
+    while (true)
+    {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
         clear();
@@ -649,9 +749,15 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
         int y = 3;
         attron(COLOR_PAIR(CLR_DIM));
         auto q_ctx = wrap_text("Q: " + card.question, content_w);
-        for (auto& l : q_ctx) { mvprintw(y++, left, "%s", l.c_str()); }
+        for (auto& l : q_ctx)
+        {
+            mvprintw(y++, left, "%s", l.c_str());
+        }
         auto a_ctx = wrap_text("A: " + card.answer, content_w);
-        for (auto& l : a_ctx) { mvprintw(y++, left, "%s", l.c_str()); }
+        for (auto& l : a_ctx)
+        {
+            mvprintw(y++, left, "%s", l.c_str());
+        }
         attroff(COLOR_PAIR(CLR_DIM));
 
         draw_hline_full(y, 0, max_x);
@@ -660,16 +766,20 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
         int resp_h = max_y - y - 4;
         if (resp_h < 1) resp_h = 1;
 
-        if (response_lines.empty() && last_question.empty()) {
+        if (response_lines.empty() && last_question.empty())
+        {
             attron(COLOR_PAIR(CLR_DIM));
             mvprintw(y + resp_h / 2, (max_x - 30) / 2, "Press [Enter] to ask a question");
             attroff(COLOR_PAIR(CLR_DIM));
-        } else {
+        }
+        else
+        {
             int total = (int)response_lines.size();
             if (scroll > total - resp_h) scroll = std::max(0, total - resp_h);
             if (scroll < 0) scroll = 0;
 
-            for (int i = 0; i < resp_h && (i + scroll) < total; i++) {
+            for (int i = 0; i < resp_h && (i + scroll) < total; i++)
+            {
                 mvprintw(y + i, left, "%s", response_lines[i + scroll].c_str());
             }
         }
@@ -685,13 +795,23 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
 
         timeout(-1);
         int ch = getch();
-        if (ch == 'q' || ch == 27) {
+        if (ch == 'q' || ch == 27)
+        {
             timeout(1000);
             return;
         }
-        if (ch == 'j' || ch == KEY_DOWN) { scroll++; continue; }
-        if (ch == 'k' || ch == KEY_UP) { if (scroll > 0) scroll--; continue; }
-        if (ch == '\n' || ch == KEY_ENTER) {
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            scroll++;
+            continue;
+        }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (scroll > 0) scroll--;
+            continue;
+        }
+        if (ch == '\n' || ch == KEY_ENTER)
+        {
             std::string question = get_input(max_y - 2, left, content_w);
             if (question.empty()) question = "Explain this card to me";
 
@@ -708,17 +828,20 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
             response_lines.push_back("");
             auto q_display = "> " + question;
             auto q_wrapped = wrap_text(q_display, content_w);
-            for (auto& l : q_wrapped) response_lines.push_back(l);
+            for (auto& l : q_wrapped)
+                response_lines.push_back(l);
             response_lines.push_back("");
 
             std::istringstream rstream(response);
             std::string para;
-            while (std::getline(rstream, para)) {
-                if (para.empty()) {
-                    response_lines.push_back("");
-                } else {
+            while (std::getline(rstream, para))
+            {
+                if (para.empty()) { response_lines.push_back(""); }
+                else
+                {
                     auto wrapped = wrap_text(para, content_w);
-                    for (auto& l : wrapped) response_lines.push_back(l);
+                    for (auto& l : wrapped)
+                        response_lines.push_back(l);
                 }
             }
             scroll = 0;
@@ -728,7 +851,8 @@ static void show_ai_assistant(const Card& card, const std::string& deck) {
 
 // Startup splash screen — random logo variant
 // Returns 'c' to continue paused session, or anything else to browse
-static int show_splash() {
+static int show_splash()
+{
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> dist(0, LOGO_COUNT - 1);
     auto& logo = LOGOS[dist(rng)];
@@ -747,18 +871,21 @@ static int show_splash() {
     if (start_y < 0) start_y = 0;
 
     attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
-    for (int i = 0; i < logo.height; i++) {
+    for (int i = 0; i < logo.height; i++)
+    {
         mvprintw(start_y + i, start_x, "%s", logo.lines[i]);
     }
     attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
 
     int hint_y = start_y + logo.height + 3;
 
-    if (has_session) {
+    if (has_session)
+    {
         std::string dname = saved["deck_name"].get<std::string>();
         int remaining = (int)saved["round"].size() + (int)saved["missed"].size();
         char cont_str[128];
-        snprintf(cont_str, sizeof(cont_str), "[c] Continue: %s (%d cards left)", dname.c_str(), remaining);
+        snprintf(cont_str, sizeof(cont_str), "[c] Continue: %s (%d cards left)", dname.c_str(),
+                 remaining);
         attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
         mvprintw(hint_y, (max_x - (int)strlen(cont_str)) / 2, "%s", cont_str);
         attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
@@ -772,7 +899,8 @@ static int show_splash() {
 
     refresh();
 
-    while (true) {
+    while (true)
+    {
         int ch = getch();
         if (ch == 'q' || ch == 27) return 'q';
         if (ch == 'c' && has_session) return 'c';
@@ -784,22 +912,23 @@ static int show_splash() {
 // Columns: parent | current | child/preview
 // Navigate with h/l to go up/down directory levels, j/k to move within a listing.
 
-static std::string browse_decks(const std::string& root) {
+static std::string browse_decks(const std::string& root)
+{
     // Navigation state: current directory path + selection index per directory
     std::string cwd = root;
-    std::map<std::string, int> selections;  // dir path -> selected index
-    std::map<std::string, int> scrolls;     // dir path -> scroll offset
+    std::map<std::string, int> selections; // dir path -> selected index
+    std::map<std::string, int> scrolls;    // dir path -> scroll offset
 
-    auto get_sel = [&](const std::string& dir) -> int {
-        return selections.count(dir) ? selections[dir] : 0;
-    };
-    auto get_scroll = [&](const std::string& dir) -> int {
-        return scrolls.count(dir) ? scrolls[dir] : 0;
-    };
+    auto get_sel = [&](const std::string& dir) -> int
+    { return selections.count(dir) ? selections[dir] : 0; };
+    auto get_scroll = [&](const std::string& dir) -> int
+    { return scrolls.count(dir) ? scrolls[dir] : 0; };
 
-    while (true) {
+    while (true)
+    {
         auto entries = list_dir(cwd);
-        if (entries.empty() && cwd != root) {
+        if (entries.empty() && cwd != root)
+        {
             // Empty dir — go back
             cwd = fs::path(cwd).parent_path().string();
             continue;
@@ -813,7 +942,8 @@ static std::string browse_decks(const std::string& root) {
         std::vector<DeckEntry> parent_entries;
         std::string parent_path;
         int parent_sel = 0;
-        if (cwd != root) {
+        if (cwd != root)
+        {
             parent_path = fs::path(cwd).parent_path().string();
             parent_entries = list_dir(parent_path);
             parent_sel = get_sel(parent_path);
@@ -821,7 +951,8 @@ static std::string browse_decks(const std::string& root) {
 
         // Child entries (preview of selected item)
         std::vector<DeckEntry> child_entries;
-        if (!entries.empty() && entries[sel].is_dir) {
+        if (!entries.empty() && entries[sel].is_dir)
+        {
             child_entries = list_dir(entries[sel].path);
         }
 
@@ -838,11 +969,13 @@ static std::string browse_decks(const std::string& root) {
 
         // Breadcrumb
         std::string crumb;
-        if (cwd.size() > root.size()) {
+        if (cwd.size() > root.size())
+        {
             crumb = cwd.substr(root.size() + 1);
             std::replace(crumb.begin(), crumb.end(), '_', ' ');
         }
-        if (!crumb.empty()) {
+        if (!crumb.empty())
+        {
             attron(COLOR_PAIR(CLR_DIM));
             mvprintw(0, 1, "%s", crumb.c_str());
             attroff(COLOR_PAIR(CLR_DIM));
@@ -861,9 +994,11 @@ static std::string browse_decks(const std::string& root) {
         // Depth 1: parent=col0, active=col1, preview=col2
         // Depth 2+: grandparent shifts out, parent=col0, active=col1, preview=col2
         int depth = 0;
-        if (cwd.size() > root.size()) {
+        if (cwd.size() > root.size())
+        {
             std::string rel = cwd.substr(root.size() + 1);
-            for (char c : rel) if (c == '/') depth++;
+            for (char c : rel)
+                if (c == '/') depth++;
             depth++;
         }
 
@@ -881,27 +1016,38 @@ static std::string browse_decks(const std::string& root) {
         int active_x, active_w, preview_x, preview_w;
         int parent_col_x = -1, parent_col_w = 0;
 
-        if (depth == 0) {
+        if (depth == 0)
+        {
             // Root: active in col0, preview in col1, col2 for deeper preview
-            active_x = col0_x; active_w = col0_w;
-            preview_x = col1_x; preview_w = col1_w;
-        } else {
+            active_x = col0_x;
+            active_w = col0_w;
+            preview_x = col1_x;
+            preview_w = col1_w;
+        }
+        else
+        {
             // Depth 1+: parent in col0, active in col1, preview in col2
-            parent_col_x = col0_x; parent_col_w = col0_w;
-            active_x = col1_x; active_w = col1_w;
-            preview_x = col2_x; preview_w = col2_w;
+            parent_col_x = col0_x;
+            parent_col_w = col0_w;
+            active_x = col1_x;
+            active_w = col1_w;
+            preview_x = col2_x;
+            preview_w = col2_w;
         }
 
         // Helper to draw a column of entries
-        auto draw_column = [&](const std::vector<DeckEntry>& items, int col_x, int w,
-                               int selected, int& scroll, bool is_active) {
+        auto draw_column = [&](const std::vector<DeckEntry>& items, int col_x, int w, int selected,
+                               int& scroll, bool is_active)
+        {
             int visible = list_h;
-            if (selected >= 0) {
+            if (selected >= 0)
+            {
                 if (selected < scroll) scroll = selected;
                 if (selected >= scroll + visible) scroll = selected - visible + 1;
             }
 
-            for (int i = 0; i < visible && (i + scroll) < (int)items.size(); i++) {
+            for (int i = 0; i < visible && (i + scroll) < (int)items.size(); i++)
+            {
                 int idx = i + scroll;
                 int y = list_start + i;
                 std::string display = strip_txt(items[idx].name);
@@ -909,26 +1055,34 @@ static std::string browse_decks(const std::string& root) {
                 std::replace(display.begin(), display.end(), '-', ' ');
                 if ((int)display.size() > w - 2) display = display.substr(0, w - 2);
 
-                if (idx == selected && is_active) {
+                if (idx == selected && is_active)
+                {
                     attron(COLOR_PAIR(CLR_HIGHLIGHT));
                     mvprintw(y, col_x + 1, "%-*s", w - 2, display.c_str());
                     attroff(COLOR_PAIR(CLR_HIGHLIGHT));
-                } else if (idx == selected && !is_active) {
+                }
+                else if (idx == selected && !is_active)
+                {
                     attron(COLOR_PAIR(CLR_HIGHLIGHT) | A_DIM);
                     mvprintw(y, col_x + 1, "%-*s", w - 2, display.c_str());
                     attroff(COLOR_PAIR(CLR_HIGHLIGHT) | A_DIM);
-                } else if (items[idx].is_dir) {
+                }
+                else if (items[idx].is_dir)
+                {
                     attron(COLOR_PAIR(CLR_DIR));
                     mvprintw(y, col_x + 1, "%s", display.c_str());
                     attroff(COLOR_PAIR(CLR_DIR));
-                } else {
+                }
+                else
+                {
                     mvprintw(y, col_x + 1, "%s", display.c_str());
                 }
             }
         };
 
         // Draw parent column (only when depth > 0)
-        if (parent_col_x >= 0 && !parent_entries.empty()) {
+        if (parent_col_x >= 0 && !parent_entries.empty())
+        {
             int ps = get_scroll(parent_path);
             draw_column(parent_entries, parent_col_x, parent_col_w, parent_sel, ps, false);
             scrolls[parent_path] = ps;
@@ -942,13 +1096,15 @@ static std::string browse_decks(const std::string& root) {
         }
 
         // Draw preview column
-        auto draw_file_preview = [&](const std::string& path, int px, int pw) {
+        auto draw_file_preview = [&](const std::string& path, int px, int pw)
+        {
             auto preview_deck = parse_deck(path);
             int n = (int)preview_deck.cards.size();
             attron(COLOR_PAIR(CLR_DIM));
             mvprintw(list_start, px + 1, "%d card%s", n, n == 1 ? "" : "s");
             int preview_y = list_start + 2;
-            for (int i = 0; i < std::min(n, list_h - 2); i++) {
+            for (int i = 0; i < std::min(n, list_h - 2); i++)
+            {
                 std::string q = preview_deck.cards[i].question;
                 if ((int)q.size() > pw - 2) q = q.substr(0, pw - 5) + "...";
                 mvprintw(preview_y + i, px + 1, "%s", q.c_str());
@@ -956,25 +1112,33 @@ static std::string browse_decks(const std::string& root) {
             attroff(COLOR_PAIR(CLR_DIM));
         };
 
-        if (!child_entries.empty()) {
+        if (!child_entries.empty())
+        {
             int dummy_scroll = 0;
             draw_column(child_entries, preview_x, preview_w, -1, dummy_scroll, false);
 
             // At root: also show col2 as deeper preview of first child item
-            if (depth == 0 && !child_entries.empty()) {
+            if (depth == 0 && !child_entries.empty())
+            {
                 // Find first item in child to preview in col2
                 auto& first_child = child_entries[0];
-                if (first_child.is_dir) {
+                if (first_child.is_dir)
+                {
                     auto grandchild = list_dir(first_child.path);
-                    if (!grandchild.empty()) {
+                    if (!grandchild.empty())
+                    {
                         int gs = 0;
                         draw_column(grandchild, col2_x, col2_w, -1, gs, false);
                     }
-                } else {
+                }
+                else
+                {
                     draw_file_preview(first_child.path, col2_x, col2_w);
                 }
             }
-        } else if (!entries.empty() && !entries[sel].is_dir) {
+        }
+        else if (!entries.empty() && !entries[sel].is_dir)
+        {
             draw_file_preview(entries[sel].path, preview_x, preview_w);
         }
 
@@ -989,39 +1153,40 @@ static std::string browse_decks(const std::string& root) {
         int ch = getch();
         if (ch == 'q' || ch == 27) return "";
 
-        if (ch == 'j' || ch == KEY_DOWN) {
-            if (sel < (int)entries.size() - 1) {
-                selections[cwd] = sel + 1;
-            }
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            if (sel < (int)entries.size() - 1) { selections[cwd] = sel + 1; }
         }
-        if (ch == 'k' || ch == KEY_UP) {
-            if (sel > 0) {
-                selections[cwd] = sel - 1;
-            }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (sel > 0) { selections[cwd] = sel - 1; }
         }
         // Enter directory or select deck
-        if (ch == 'l' || ch == KEY_RIGHT || ch == '\n' || ch == KEY_ENTER) {
-            if (!entries.empty()) {
-                if (entries[sel].is_dir) {
-                    cwd = entries[sel].path;
-                } else {
+        if (ch == 'l' || ch == KEY_RIGHT || ch == '\n' || ch == KEY_ENTER)
+        {
+            if (!entries.empty())
+            {
+                if (entries[sel].is_dir) { cwd = entries[sel].path; }
+                else
+                {
                     return entries[sel].path;
                 }
             }
         }
         // Go up
-        if (ch == 'h' || ch == KEY_LEFT) {
-            if (cwd != root) {
-                cwd = fs::path(cwd).parent_path().string();
-            }
+        if (ch == 'h' || ch == KEY_LEFT)
+        {
+            if (cwd != root) { cwd = fs::path(cwd).parent_path().string(); }
         }
     }
 }
 
 // Get a deck ID from a file path (relative to deck root)
-static std::string deck_id_from_path(const std::string& path, const std::string& root) {
+static std::string deck_id_from_path(const std::string& path, const std::string& root)
+{
     std::string rel = path.substr(root.size() + 1);
-    if (rel.size() > 4 && rel.substr(rel.size() - 4) == ".txt") {
+    if (rel.size() > 4 && rel.substr(rel.size() - 4) == ".txt")
+    {
         rel = rel.substr(0, rel.size() - 4);
     }
     return rel;
@@ -1030,9 +1195,11 @@ static std::string deck_id_from_path(const std::string& path, const std::string&
 // Pre-drill summary screen — shows deck info and stats, waits for keypress to begin
 // Returns true to start drill, false to go back to browser
 static bool show_deck_summary(const std::string& deck_name, const std::string& summary,
-                               const std::string& deck_id, int card_count, Progress& progress) {
+                              const std::string& deck_id, int card_count, Progress& progress)
+{
     timeout(-1); // block until keypress
-    while (true) {
+    while (true)
+    {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
         clear();
@@ -1051,10 +1218,12 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
         y += 2;
 
         // Summary text
-        if (!summary.empty()) {
+        if (!summary.empty())
+        {
             auto lines = wrap_text(summary, content_w);
             attron(COLOR_PAIR(CLR_DEFAULT));
-            for (auto& l : lines) {
+            for (auto& l : lines)
+            {
                 mvprintw(y, cx, "%s", l.c_str());
                 y++;
             }
@@ -1066,11 +1235,15 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
 
         // Card stage distribution
         int new_count = 0, familiar_count = 0, strong_count = 0;
-        for (int i = 0; i < card_count; i++) {
+        for (int i = 0; i < card_count; i++)
+        {
             int stage = progress.get_stage(deck_id, i);
-            if (stage == 0) new_count++;
-            else if (stage == 1) familiar_count++;
-            else strong_count++;
+            if (stage == 0)
+                new_count++;
+            else if (stage == 1)
+                familiar_count++;
+            else
+                strong_count++;
         }
 
         char total_str[64];
@@ -1082,17 +1255,21 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
 
         // Stage bars
         int bar_w = content_w - 16;
-        auto draw_bar = [&](const char* label, int count, int color) {
+        auto draw_bar = [&](const char* label, int count, int color)
+        {
             attron(COLOR_PAIR(color));
             mvprintw(y, cx, "%-10s %3d  ", label, count);
             attroff(COLOR_PAIR(color));
-            if (card_count > 0 && bar_w > 0) {
+            if (card_count > 0 && bar_w > 0)
+            {
                 int filled = (count * bar_w) / card_count;
                 attron(COLOR_PAIR(color));
-                for (int i = 0; i < filled; i++) addch(ACS_BLOCK);
+                for (int i = 0; i < filled; i++)
+                    addch(ACS_BLOCK);
                 attroff(COLOR_PAIR(color));
                 attron(COLOR_PAIR(CLR_DIM));
-                for (int i = filled; i < bar_w; i++) addch(ACS_BULLET);
+                for (int i = filled; i < bar_w; i++)
+                    addch(ACS_BULLET);
                 attroff(COLOR_PAIR(CLR_DIM));
             }
             y++;
@@ -1103,7 +1280,8 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
         draw_bar("Strong", strong_count, CLR_STAGE_STRONG);
 
         // Deck stats (completions/abandonments)
-        if (progress.deck_stats.contains(deck_id)) {
+        if (progress.deck_stats.contains(deck_id))
+        {
             auto& ds = progress.deck_stats[deck_id];
             y += 2;
             draw_hline_full(y, 0, max_x);
@@ -1134,7 +1312,8 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
 }
 
 // Drill TUI - centered card with box
-static std::string format_elapsed(time_t start) {
+static std::string format_elapsed(time_t start)
+{
     int elapsed = (int)difftime(time(nullptr), start);
     int h = elapsed / 3600;
     int m = (elapsed % 3600) / 60;
@@ -1148,13 +1327,17 @@ static std::string format_elapsed(time_t start) {
 }
 
 // Returns true if completed, false if paused/quit
-static bool run_drill(DrillSession& session, const std::string& deck_path, int elapsed_offset = 0) {
+static bool run_drill(DrillSession& session, const std::string& deck_path, int elapsed_offset = 0)
+{
     time_t session_start = time(nullptr) - elapsed_offset;
     timeout(1000); // getch returns ERR after 1s so timer updates
-    while (true) {
+    while (true)
+    {
         // Check if round is done
-        if (session.round.empty()) {
-            if (!session.next_round()) {
+        if (session.round.empty())
+        {
+            if (!session.next_round())
+            {
                 // All mastered - completion screen
                 int max_y, max_x;
                 getmaxyx(stdscr, max_y, max_x);
@@ -1200,7 +1383,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
         int stage = session.progress->get_stage(session.deck_id, card_idx);
 
         // --- Show question ---
-        while (true) {
+        while (true)
+        {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
             clear();
@@ -1210,11 +1394,13 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             std::string elapsed = format_elapsed(session_start);
             attron(COLOR_PAIR(CLR_HEADER));
             mvprintw(0, 1, "%s", elapsed.c_str());
-            mvprintw(0, (max_x - (int)session.deck_name.size()) / 2, "%s", session.deck_name.c_str());
+            mvprintw(0, (max_x - (int)session.deck_name.size()) / 2, "%s",
+                     session.deck_name.c_str());
             attroff(COLOR_PAIR(CLR_HEADER));
 
             char mastered_str[64];
-            snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered, (int)session.cards.size());
+            snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered,
+                     (int)session.cards.size());
             attron(COLOR_PAIR(CLR_HEADER));
             mvprintw(0, max_x - (int)strlen(mastered_str) - 1, "%s", mastered_str);
             attroff(COLOR_PAIR(CLR_HEADER));
@@ -1269,7 +1455,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             y += 2;
 
             // Question text
-            for (auto& l : q_lines) {
+            for (auto& l : q_lines)
+            {
                 mvprintw(y, inner_x, "%s", l.c_str());
                 y++;
             }
@@ -1279,22 +1466,33 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
-            if (total_cards_q > 0) {
+            if (total_cards_q > 0)
+            {
                 int n = total_cards_q;
                 int gaps = n - 1;
                 int usable = max_x - gaps;
                 int base_w = usable / n;
                 int extra = usable % n;
-                if (base_w < 1) { base_w = 1; extra = 0; }
+                if (base_w < 1)
+                {
+                    base_w = 1;
+                    extra = 0;
+                }
                 move(max_y - 1, 0);
-                for (int i = 0; i < n; i++) {
+                for (int i = 0; i < n; i++)
+                {
                     int start_extra = (n - extra) / 2;
                     int w = base_w + (i >= start_extra && i < start_extra + extra ? 1 : 0);
-                    if (i < mastered) attron(COLOR_PAIR(CLR_CORRECT));
-                    else attron(COLOR_PAIR(CLR_DIM));
-                    for (int j = 0; j < w; j++) addch(ACS_HLINE);
-                    if (i < mastered) attroff(COLOR_PAIR(CLR_CORRECT));
-                    else attroff(COLOR_PAIR(CLR_DIM));
+                    if (i < mastered)
+                        attron(COLOR_PAIR(CLR_CORRECT));
+                    else
+                        attron(COLOR_PAIR(CLR_DIM));
+                    for (int j = 0; j < w; j++)
+                        addch(ACS_HLINE);
+                    if (i < mastered)
+                        attroff(COLOR_PAIR(CLR_CORRECT));
+                    else
+                        attroff(COLOR_PAIR(CLR_DIM));
                     if (i < n - 1) addch(' ');
                 }
             }
@@ -1303,19 +1501,26 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             int ch = getch();
             if (ch == ERR) continue; // timeout - redraw for timer
-            if (ch == 'q' || ch == 27) {
+            if (ch == 'q' || ch == 27)
+            {
                 session.round.push_back(card_idx); // put card back
                 int elapsed = (int)difftime(time(nullptr), session_start);
                 session.save_session(deck_path, elapsed);
                 timeout(-1);
                 return false;
             }
-            if (ch == 'a') { show_ai_assistant(card, session.deck_name); timeout(1000); continue; }
+            if (ch == 'a')
+            {
+                show_ai_assistant(card, session.deck_name);
+                timeout(1000);
+                continue;
+            }
             if (ch == ' ') break;
         }
 
         // --- Show answer ---
-        while (true) {
+        while (true)
+        {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
             clear();
@@ -1324,8 +1529,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             int mastered = session.mastered_count();
             attron(COLOR_PAIR(CLR_DIM));
             char status_left[128];
-            snprintf(status_left, sizeof(status_left), "%d/%d mastered",
-                     mastered, (int)session.cards.size());
+            snprintf(status_left, sizeof(status_left), "%d/%d mastered", mastered,
+                     (int)session.cards.size());
             mvprintw(0, 1, "%s", status_left);
 
             char status_mid[64];
@@ -1370,7 +1575,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Question
             attron(COLOR_PAIR(CLR_DIM));
-            for (auto& l : q_wrapped) {
+            for (auto& l : q_wrapped)
+            {
                 mvprintw(y, inner_x, "%s", l.c_str());
                 y++;
             }
@@ -1385,7 +1591,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Answer
             attron(A_BOLD);
-            for (auto& l : a_wrapped) {
+            for (auto& l : a_wrapped)
+            {
                 mvprintw(y, inner_x, "%s", l.c_str());
                 y++;
             }
@@ -1402,17 +1609,24 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_a = (int)session.cards.size();
-            if (total_cards_a > 0) {
+            if (total_cards_a > 0)
+            {
                 move(max_y - 1, 0);
-                for (int i = 0; i < total_cards_a; i++) {
+                for (int i = 0; i < total_cards_a; i++)
+                {
                     int seg_start = (i * max_x) / total_cards_a;
                     int seg_end = ((i + 1) * max_x) / total_cards_a;
                     int seg_w = seg_end - seg_start;
-                    if (i < mastered) attron(COLOR_PAIR(CLR_CORRECT));
-                    else attron(COLOR_PAIR(CLR_DIM));
-                    for (int j = 0; j < seg_w; j++) addch(ACS_HLINE);
-                    if (i < mastered) attroff(COLOR_PAIR(CLR_CORRECT));
-                    else attroff(COLOR_PAIR(CLR_DIM));
+                    if (i < mastered)
+                        attron(COLOR_PAIR(CLR_CORRECT));
+                    else
+                        attron(COLOR_PAIR(CLR_DIM));
+                    for (int j = 0; j < seg_w; j++)
+                        addch(ACS_HLINE);
+                    if (i < mastered)
+                        attroff(COLOR_PAIR(CLR_CORRECT));
+                    else
+                        attroff(COLOR_PAIR(CLR_DIM));
                 }
             }
 
@@ -1420,19 +1634,27 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             int ch = getch();
             if (ch == ERR) continue; // timeout - redraw for timer
-            if (ch == 'q' || ch == 27) {
+            if (ch == 'q' || ch == 27)
+            {
                 session.round.push_back(card_idx); // put card back
                 int elapsed = (int)difftime(time(nullptr), session_start);
                 session.save_session(deck_path, elapsed);
                 timeout(-1);
                 return false;
             }
-            if (ch == 'a') { show_ai_assistant(card, session.deck_name); timeout(1000); continue; }
-            if (ch == 'y') {
+            if (ch == 'a')
+            {
+                show_ai_assistant(card, session.deck_name);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'y')
+            {
                 session.mark_correct(card_idx);
                 break;
             }
-            if (ch == 'n') {
+            if (ch == 'n')
+            {
                 session.mark_wrong(card_idx);
                 break;
             }
@@ -1440,7 +1662,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
     }
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     std::string deck_root = expand_home(DECK_DIR);
 
     // Init ncurses
@@ -1451,25 +1674,27 @@ int main(int argc, char* argv[]) {
     keypad(stdscr, TRUE);
     curs_set(0);
 
-    if (has_colors()) {
-        init_colors();
-    }
+    if (has_colors()) { init_colors(); }
 
     // Load progress
     Progress progress;
     progress.load();
 
-    while (true) {
+    while (true)
+    {
         int splash_ch = show_splash();
         if (splash_ch == 'q') break;
 
         // Resume paused session
-        if (splash_ch == 'c') {
+        if (splash_ch == 'c')
+        {
             auto saved = DrillSession::load_session();
-            if (saved.contains("deck_path")) {
+            if (saved.contains("deck_path"))
+            {
                 std::string deck_path = saved["deck_path"].get<std::string>();
                 auto deck = parse_deck(deck_path);
-                if (!deck.cards.empty()) {
+                if (!deck.cards.empty())
+                {
                     DrillSession session;
                     session.restore(saved, std::move(deck.cards), &progress);
                     int elapsed = saved.value("elapsed", 0);
@@ -1482,7 +1707,8 @@ int main(int argc, char* argv[]) {
         }
 
         // Normal browse flow
-        while (true) {
+        while (true)
+        {
             std::string deck_path = browse_decks(deck_root);
             if (deck_path.empty()) break;
 
@@ -1496,7 +1722,8 @@ int main(int argc, char* argv[]) {
             std::replace(dname.begin(), dname.end(), '_', ' ');
             std::replace(dname.begin(), dname.end(), '-', ' ');
 
-            if (!show_deck_summary(dname, deck.summary, deck_id, (int)deck.cards.size(), progress)) {
+            if (!show_deck_summary(dname, deck.summary, deck_id, (int)deck.cards.size(), progress))
+            {
                 continue;
             }
 
