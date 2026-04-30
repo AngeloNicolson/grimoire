@@ -52,16 +52,54 @@ static std::string collapse_home(const std::string& path)
     return path;
 }
 
+static std::string normalize_path(const std::string& path)
+{
+    if (path.empty()) return "";
+    try
+    {
+        return fs::absolute(expand_home(path)).lexically_normal().string();
+    }
+    catch (...)
+    {
+        return expand_home(path);
+    }
+}
+
 struct AppConfig
 {
-    std::string vault_root;
+    std::string current_vault;
+    std::vector<std::string> known_vaults;
 
     void apply() const
     {
-        g_vault_root = vault_root.empty() ? DEFAULT_VAULT_ROOT : vault_root;
+        g_vault_root = current_vault.empty() ? normalize_path(DEFAULT_VAULT_ROOT) : current_vault;
         g_deck_dir = g_vault_root + "/decks";
         g_data_file = DEFAULT_DATA_FILE;
         g_session_file = DEFAULT_SESSION_FILE;
+    }
+
+    void ensure_consistency()
+    {
+        if (current_vault.empty() && !known_vaults.empty()) current_vault = known_vaults.front();
+        if (current_vault.empty()) return;
+
+        current_vault = normalize_path(current_vault);
+        bool found = false;
+        for (auto& vault : known_vaults)
+        {
+            vault = normalize_path(vault);
+            if (vault == current_vault) found = true;
+        }
+        if (!found) known_vaults.insert(known_vaults.begin(), current_vault);
+
+        std::sort(known_vaults.begin(), known_vaults.end());
+        known_vaults.erase(std::unique(known_vaults.begin(), known_vaults.end()), known_vaults.end());
+    }
+
+    void set_current_vault(const std::string& path)
+    {
+        current_vault = normalize_path(path);
+        ensure_consistency();
     }
 
     bool load()
@@ -72,14 +110,17 @@ struct AppConfig
         try
         {
             json data = json::parse(file);
-            vault_root = data.value("vault_root", "");
+            current_vault = data.value("current_vault", "");
+            known_vaults = data.value("known_vaults", std::vector<std::string>{});
+            if (current_vault.empty()) current_vault = data.value("vault_root", "");
         }
         catch (...)
         {
             return false;
         }
 
-        if (vault_root.empty()) return false;
+        ensure_consistency();
+        if (current_vault.empty()) return false;
         apply();
         return true;
     }
@@ -92,8 +133,12 @@ struct AppConfig
         std::ofstream file(path);
         if (!file.is_open()) return false;
 
+        AppConfig normalized = *this;
+        normalized.ensure_consistency();
+
         json data;
-        data["vault_root"] = vault_root;
+        data["current_vault"] = normalized.current_vault;
+        data["known_vaults"] = normalized.known_vaults;
         file << data.dump(2);
         return true;
     }
@@ -123,6 +168,56 @@ struct Deck
     std::string summary;
     std::vector<Card> cards;
 };
+
+static std::string make_note_ref_portable(const std::string& path)
+{
+    if (path.empty()) return "";
+
+    fs::path absolute = fs::absolute(path);
+    fs::path vault_root = fs::absolute(expand_home(g_vault_root));
+
+    std::string abs_str = absolute.lexically_normal().string();
+    std::string root_str = vault_root.lexically_normal().string();
+
+    if (abs_str == root_str) return ".";
+    if (abs_str.size() > root_str.size() && abs_str.compare(0, root_str.size(), root_str) == 0 &&
+        abs_str[root_str.size()] == '/')
+        return abs_str.substr(root_str.size() + 1);
+    return collapse_home(abs_str);
+}
+
+static bool save_deck(const std::string& path, const Deck& deck)
+{
+    std::ofstream file(path);
+    if (!file.is_open()) return false;
+
+    bool has_metadata = !deck.id.empty() || !deck.title.empty();
+    if (has_metadata)
+    {
+        file << "---\n";
+        if (!deck.id.empty()) file << "deck_id: " << deck.id << "\n";
+        if (!deck.title.empty()) file << "title: " << deck.title << "\n";
+        file << "---\n";
+    }
+
+    if (!deck.summary.empty())
+    {
+        file << deck.summary << "\n";
+        file << "---\n";
+    }
+
+    for (size_t i = 0; i < deck.cards.size(); i++)
+    {
+        const auto& card = deck.cards[i];
+        file << "Q:\n" << card.question << "\n";
+        file << "A:\n" << card.answer << "\n";
+        if (!card.id.empty()) file << "ID:\n" << card.id << "\n";
+        if (!card.note_ref.empty()) file << "NOTE:\n" << card.note_ref << "\n";
+        if (i + 1 < deck.cards.size()) file << "\n";
+    }
+
+    return true;
+}
 
 static std::string trim(const std::string& value)
 {
@@ -981,6 +1076,10 @@ static void draw_box(int y, int x, int h, int w)
 
 static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
                                   const std::string& footer = "");
+static std::string prompt_path_screen(const std::string& title, const std::vector<std::string>& lines,
+                                      const std::string& default_value);
+static void ensure_vault_dirs(const std::string& vault_root);
+static bool run_first_time_setup(AppConfig& config);
 
 // --- AI ---
 
@@ -1063,6 +1162,50 @@ static void open_note_ref(const Card& card)
     clear();
 }
 
+static bool assign_note_ref_for_card(const std::string& deck_path, std::vector<Card>& session_cards,
+                                     int card_idx)
+{
+    if (card_idx < 0 || card_idx >= (int)session_cards.size()) return false;
+
+    Card& card = session_cards[card_idx];
+    std::string default_value = card.note_ref.empty() ? expand_home(g_vault_root) : card.note_ref;
+
+    std::string input = prompt_path_screen(
+        "Attach Note",
+        {"Enter the note path to attach to this card.",
+         "If the note is inside your vault, Grimoire will save it as a vault-relative path."},
+        default_value);
+
+    if (input.empty()) return false;
+
+    std::string trimmed_input = trim(input);
+    std::string stored_ref = trimmed_input;
+    std::string maybe_path = expand_home(trimmed_input);
+
+    if (fs::exists(maybe_path)) stored_ref = make_note_ref_portable(maybe_path);
+
+    Deck deck = parse_deck(deck_path);
+    if (card_idx >= (int)deck.cards.size())
+    {
+        show_blocking_message("Attach Failed",
+                              {"The deck changed on disk and the current card could not be updated."});
+        return false;
+    }
+
+    deck.cards[card_idx].note_ref = stored_ref;
+    if (!save_deck(deck_path, deck))
+    {
+        show_blocking_message("Save Failed",
+                              {"Grimoire could not write the updated deck file."});
+        return false;
+    }
+
+    card.note_ref = stored_ref;
+    show_blocking_message("Note Attached",
+                          {"This card is now linked to:", stored_ref});
+    return true;
+}
+
 static std::string query_ollama(const std::string& model, const Card& card, const std::string& deck,
                                 const std::string& user_question)
 {
@@ -1138,9 +1281,16 @@ static std::string get_loaded_model()
     return model;
 }
 
-static std::string get_input(int y, int x, int max_w)
+struct TextInputResult
+{
+    std::string value;
+    bool cancelled = false;
+};
+
+static TextInputResult get_input_result(int y, int x, int max_w)
 {
     std::string input;
+    bool cancelled = false;
     curs_set(1);
     timeout(-1);
     while (true)
@@ -1152,14 +1302,19 @@ static std::string get_input(int y, int x, int max_w)
         if (ch == '\n' || ch == KEY_ENTER) break;
         if (ch == 27)
         {
-            input.clear();
+            cancelled = true;
             break;
         }
         if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty()) { input.pop_back(); }
         else if (ch >= 32 && ch < 127 && (int)input.size() < max_w - 4) { input += (char)ch; }
     }
     curs_set(0);
-    return input;
+    return {input, cancelled};
+}
+
+static std::string get_input(int y, int x, int max_w)
+{
+    return get_input_result(y, x, max_w).value;
 }
 
 static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
@@ -1206,9 +1361,10 @@ static std::string prompt_path_screen(const std::string& title, const std::vecto
     if (!default_value.empty()) prompt += " [" + collapse_home(default_value) + "]";
     mvprintw(max_y - 4, 3, "%s", prompt.c_str());
 
-    std::string input = get_input(max_y - 3, 3, std::max(20, max_x - 6));
-    if (input.empty()) return default_value;
-    return input;
+    TextInputResult result = get_input_result(max_y - 3, 3, std::max(20, max_x - 6));
+    if (result.cancelled) return "";
+    if (result.value.empty()) return default_value;
+    return result.value;
 }
 
 static void ensure_vault_dirs(const std::string& vault_root)
@@ -1218,7 +1374,77 @@ static void ensure_vault_dirs(const std::string& vault_root)
     fs::create_directories(fs::path(vault_root) / "media");
 }
 
-static bool run_first_time_setup()
+static bool configure_existing_vault(AppConfig& config, const std::string& suggested_path)
+{
+    std::string path = prompt_path_screen(
+        "Existing Vault",
+        {"Enter the path to your existing Grimoire vault.",
+         "If the vault is missing decks/, Grimoire will create the standard folders there."},
+        suggested_path);
+    if (path.empty()) return false;
+
+    path = normalize_path(path);
+    if (!fs::exists(path) || !fs::is_directory(path))
+    {
+        draw_centered_message("Invalid Path",
+                              {"That path does not exist or is not a directory."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+
+    ensure_vault_dirs(path);
+    config.set_current_vault(path);
+    if (!config.save())
+    {
+        draw_centered_message("Config Error",
+                              {"Grimoire could not save its configuration file."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+    config.apply();
+    DrillSession::clear_session();
+    return true;
+}
+
+static bool create_new_vault(AppConfig& config, const std::string& suggested_path)
+{
+    std::string path = prompt_path_screen(
+        "New Vault",
+        {"Enter where the new Grimoire vault should be created."},
+        suggested_path);
+    if (path.empty()) return false;
+
+    path = normalize_path(path);
+    try
+    {
+        ensure_vault_dirs(path);
+    }
+    catch (...)
+    {
+        draw_centered_message("Create Failed",
+                              {"Grimoire could not create the vault at that location."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+
+    config.set_current_vault(path);
+    if (!config.save())
+    {
+        draw_centered_message("Config Error",
+                              {"Grimoire could not save its configuration file."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+    config.apply();
+    DrillSession::clear_session();
+    return true;
+}
+
+static bool run_first_time_setup(AppConfig& config)
 {
     while (true)
     {
@@ -1232,75 +1458,104 @@ static bool run_first_time_setup()
         int ch = getch();
         if (ch == 'q' || ch == 27) return false;
 
-        if (ch == 'e')
+        if (ch == 'e' && configure_existing_vault(config, expand_home(DEFAULT_VAULT_ROOT))) return true;
+        if (ch == 'n' && create_new_vault(config, expand_home(DEFAULT_VAULT_ROOT))) return true;
+    }
+}
+
+static bool manage_vaults(AppConfig& config)
+{
+    int selected = 0;
+    int scroll = 0;
+
+    while (true)
+    {
+        config.ensure_consistency();
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        std::string title = "Vaults";
+        mvprintw(0, (max_x - (int)title.size()) / 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        draw_hline_full(1, 0, max_x);
+
+        std::vector<std::string> lines = config.known_vaults;
+        int visible = std::max(1, max_y - 6);
+        if (selected >= (int)lines.size()) selected = std::max(0, (int)lines.size() - 1);
+        if (selected < scroll) scroll = selected;
+        if (selected >= scroll + visible) scroll = selected - visible + 1;
+
+        int y = 3;
+        if (lines.empty())
         {
-            std::string path = prompt_path_screen(
-                "Existing Vault",
-                {"Enter the path to your existing Grimoire vault.",
-                 "If the vault is missing decks/, Grimoire will create the standard folders there."},
-                expand_home(DEFAULT_VAULT_ROOT));
-            if (path.empty()) continue;
-
-            path = expand_home(path);
-            if (!fs::exists(path) || !fs::is_directory(path))
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(y, 3, "No configured vaults yet.");
+            attroff(COLOR_PAIR(CLR_DIM));
+        }
+        else
+        {
+            for (int i = 0; i < visible && (i + scroll) < (int)lines.size(); i++)
             {
-                draw_centered_message("Invalid Path",
-                                      {"That path does not exist or is not a directory."},
-                                      "[Any key] back");
-                getch();
-                continue;
+                int idx = i + scroll;
+                std::string display = collapse_home(lines[idx]);
+                if (lines[idx] == config.current_vault) display += " [current]";
+
+                if (idx == selected)
+                {
+                    attron(COLOR_PAIR(CLR_HIGHLIGHT));
+                    mvprintw(y + i, 3, "%-*s", max_x - 6, display.c_str());
+                    attroff(COLOR_PAIR(CLR_HIGHLIGHT));
+                }
+                else
+                {
+                    mvprintw(y + i, 3, "%s", display.c_str());
+                }
             }
+        }
 
-            ensure_vault_dirs(path);
+        draw_hline_full(max_y - 2, 0, max_x);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 1, 1,
+                 "[j/k] navigate  [Enter] switch  [a] add existing  [n] new vault  [q] back");
+        attroff(COLOR_PAIR(CLR_DIM));
+        refresh();
 
-            AppConfig config;
-            config.vault_root = path;
-            if (!config.save())
+        int ch = getch();
+        if (ch == 'q' || ch == 27) return false;
+        if ((ch == 'j' || ch == KEY_DOWN) && selected < (int)lines.size() - 1) selected++;
+        if ((ch == 'k' || ch == KEY_UP) && selected > 0) selected--;
+
+        if (ch == '\n' || ch == KEY_ENTER)
+        {
+            if (!lines.empty())
             {
-                draw_centered_message("Config Error",
-                                      {"Grimoire could not save its configuration file."},
-                                      "[Any key] back");
-                getch();
-                continue;
+                config.set_current_vault(lines[selected]);
+                if (config.save())
+                {
+                    config.apply();
+                    DrillSession::clear_session();
+                    return true;
+                }
+                show_blocking_message("Config Error",
+                                      {"Grimoire could not save the selected vault."});
             }
-            config.apply();
-            return true;
+        }
+
+        if (ch == 'a')
+        {
+            std::string suggested =
+                !config.current_vault.empty() ? config.current_vault : expand_home(DEFAULT_VAULT_ROOT);
+            if (configure_existing_vault(config, suggested)) return true;
         }
 
         if (ch == 'n')
         {
-            std::string path = prompt_path_screen(
-                "New Vault",
-                {"Enter where the new Grimoire vault should be created."},
-                expand_home(DEFAULT_VAULT_ROOT));
-            if (path.empty()) continue;
-
-            path = expand_home(path);
-            try
-            {
-                ensure_vault_dirs(path);
-            }
-            catch (...)
-            {
-                draw_centered_message("Create Failed",
-                                      {"Grimoire could not create the vault at that location."},
-                                      "[Any key] back");
-                getch();
-                continue;
-            }
-
-            AppConfig config;
-            config.vault_root = path;
-            if (!config.save())
-            {
-                draw_centered_message("Config Error",
-                                      {"Grimoire could not save its configuration file."},
-                                      "[Any key] back");
-                getch();
-                continue;
-            }
-            config.apply();
-            return true;
+            std::string suggested =
+                !config.current_vault.empty() ? config.current_vault : expand_home(DEFAULT_VAULT_ROOT);
+            if (create_new_vault(config, suggested)) return true;
         }
     }
 }
@@ -1615,6 +1870,12 @@ static int show_splash()
 
     int hint_y = start_y + logo.height + 3;
 
+    std::string vault_label = "Vault: " + collapse_home(g_vault_root);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(hint_y, (max_x - (int)vault_label.size()) / 2, "%s", vault_label.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    hint_y += 2;
+
     if (has_session)
     {
         std::string dname = saved["deck_name"].get<std::string>();
@@ -1628,7 +1889,7 @@ static int show_splash()
         hint_y += 2;
     }
 
-    std::string hint = "[Enter] Browse decks  [q] Quit";
+    std::string hint = "[Enter] Browse decks  [v] Vaults  [q] Quit";
     attron(COLOR_PAIR(CLR_DIM));
     mvprintw(hint_y, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
     attroff(COLOR_PAIR(CLR_DIM));
@@ -1639,6 +1900,7 @@ static int show_splash()
     {
         int ch = getch();
         if (ch == 'q' || ch == 27) return 'q';
+        if (ch == 'v') return 'v';
         if (ch == 'c' && has_session) return 'c';
         if (ch == '\n' || ch == ' ' || !has_session) return '\n';
     }
@@ -2198,7 +2460,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Hints then progress bar at very bottom
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[Space] Show Answer  [n] Note  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [n] Open Note  [N] Set Note  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
             if (total_cards_q > 0)
@@ -2253,6 +2515,12 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             if (ch == 'n')
             {
                 open_note_ref(card);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'N')
+            {
+                assign_note_ref_for_card(deck_path, session.cards, card_idx);
                 timeout(1000);
                 continue;
             }
@@ -2336,7 +2604,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 3, 20, "[n] No (drop)");
             attroff(COLOR_PAIR(CLR_WRONG));
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[N] Set Note  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_a = (int)session.cards.size();
             if (total_cards_a > 0)
@@ -2378,6 +2646,12 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 timeout(1000);
                 continue;
             }
+            if (ch == 'N')
+            {
+                assign_note_ref_for_card(deck_path, session.cards, card_idx);
+                timeout(1000);
+                continue;
+            }
             if (ch == 'y')
             {
                 session.mark_correct(card_idx);
@@ -2407,14 +2681,12 @@ int main(int argc, char* argv[])
     AppConfig config;
     if (!config.load())
     {
-        if (!run_first_time_setup())
+        if (!run_first_time_setup(config))
         {
             endwin();
             return 0;
         }
     }
-
-    std::string deck_root = expand_home(g_deck_dir);
 
     // Load progress
     Progress progress;
@@ -2424,6 +2696,11 @@ int main(int argc, char* argv[])
     {
         int splash_ch = show_splash();
         if (splash_ch == 'q') break;
+        if (splash_ch == 'v')
+        {
+            manage_vaults(config);
+            continue;
+        }
 
         // Resume paused session
         if (splash_ch == 'c')
@@ -2449,6 +2726,7 @@ int main(int argc, char* argv[])
         // Normal browse flow
         while (true)
         {
+            std::string deck_root = expand_home(g_deck_dir);
             std::string deck_path = browse_decks(deck_root);
             if (deck_path.empty()) break;
 

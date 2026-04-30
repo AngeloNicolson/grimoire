@@ -139,6 +139,7 @@ The deck browser shows subjects on the left and decks on the right.
 |-----|--------|
 | `Space` | Show answer |
 | `n` | Open linked note for the current card while viewing the question |
+| `N` | Set or update the linked note for the current card |
 | `y` | Correct (streak +1) |
 | `n` | Wrong on the answer screen (stage drops, streak resets) |
 | `a` | Ask AI about this card |
