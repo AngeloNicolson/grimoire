@@ -979,6 +979,9 @@ static void draw_box(int y, int x, int h, int w)
     attroff(COLOR_PAIR(CLR_BORDER));
 }
 
+static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer = "");
+
 // --- AI ---
 
 static const std::string OLLAMA_URL = "http://localhost:11434";
@@ -995,6 +998,69 @@ static std::string shell_escape(const std::string& s)
     }
     out += "'";
     return out;
+}
+
+static std::string strip_note_anchor(const std::string& note_ref)
+{
+    size_t hash = note_ref.find('#');
+    if (hash == std::string::npos) return note_ref;
+    return note_ref.substr(0, hash);
+}
+
+static std::string resolve_note_ref_path(const std::string& note_ref)
+{
+    std::string base = trim(strip_note_anchor(note_ref));
+    if (base.empty()) return "";
+
+    std::string expanded = expand_home(base);
+    if (fs::exists(expanded)) return expanded;
+
+    fs::path vault_root = expand_home(g_vault_root);
+    fs::path candidate = vault_root / base;
+    if (fs::exists(candidate)) return candidate.string();
+
+    candidate = vault_root / "notes" / base;
+    if (fs::exists(candidate)) return candidate.string();
+
+    return "";
+}
+
+static void show_blocking_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer = "[Any key] back")
+{
+    timeout(-1);
+    draw_centered_message(title, lines, footer);
+    getch();
+}
+
+static void open_note_ref(const Card& card)
+{
+    if (card.note_ref.empty())
+    {
+        show_blocking_message("No Note Reference",
+                              {"This card does not have a linked note."});
+        return;
+    }
+
+    std::string resolved = resolve_note_ref_path(card.note_ref);
+    if (resolved.empty())
+    {
+        show_blocking_message("Note Not Found",
+                              {"Grimoire could not resolve this note reference:",
+                               card.note_ref});
+        return;
+    }
+
+    const char* editor = std::getenv("EDITOR");
+    std::string editor_cmd = (editor && *editor) ? editor : "nano";
+    std::string command = editor_cmd + " " + shell_escape(resolved);
+
+    def_prog_mode();
+    endwin();
+    system(command.c_str());
+    reset_prog_mode();
+    refresh();
+    clear();
 }
 
 static std::string query_ollama(const std::string& model, const Card& card, const std::string& deck,
@@ -1097,7 +1163,7 @@ static std::string get_input(int y, int x, int max_w)
 }
 
 static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
-                                  const std::string& footer = "")
+                                  const std::string& footer)
 {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
@@ -2132,7 +2198,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Hints then progress bar at very bottom
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [n] Note  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
             if (total_cards_q > 0)
@@ -2181,6 +2247,12 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             if (ch == 'a')
             {
                 show_ai_assistant(card, session.deck_name);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'n')
+            {
+                open_note_ref(card);
                 timeout(1000);
                 continue;
             }

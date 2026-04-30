@@ -138,8 +138,9 @@ The deck browser shows subjects on the left and decks on the right.
 | Key | Action |
 |-----|--------|
 | `Space` | Show answer |
+| `n` | Open linked note for the current card while viewing the question |
 | `y` | Correct (streak +1) |
-| `n` | Wrong (stage drops, streak resets) |
+| `n` | Wrong on the answer screen (stage drops, streak resets) |
 | `a` | Ask AI about this card |
 | `q` | Quit session |
 
