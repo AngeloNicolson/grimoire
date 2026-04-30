@@ -41,21 +41,76 @@ Press `a` during a drill to ask an AI about the current card. Grimoire integrate
 
 ## Card Format
 
+Grimoire supports both single-line cards and block cards.
+
+### Single-line cards
+
 Plain text files with `::` as the delimiter:
 
-```
+```text
 What is DNS? :: Domain Name System - translates domain names into IP addresses.
 What port does DNS use? :: 53.
 ```
 
-One card per line. Empty lines and lines without `::` are ignored.
+You can also add stable card ids and note references inline:
+
+```text
+What is DNS? :: Domain Name System. :: id=dns-definition :: note=Study-Vault/Programming/Computer Science/Computer Networks/DNS.md#DNS
+```
+
+### Block cards
+
+Use block cards for multiline content, code samples, stable ids, and note references:
+
+```text
+Q:
+What is DNS?
+A:
+Domain Name System - translates domain names into IP addresses.
+ID:
+dns-definition
+NOTE:
+Study-Vault/Programming/Computer Science/Computer Networks/DNS.md#DNS
+```
+
+### Deck metadata
+
+Deck files can optionally begin with metadata:
+
+```text
+---
+deck_id: networking.dns.core
+title: DNS Core Concepts
+---
+Brief deck summary here.
+---
+What is DNS? :: Domain Name System.
+```
+
+If `deck_id` is present, Grimoire uses it instead of the file path for progress tracking. This lets you move deck files without losing progress. If a card has an `id`, Grimoire also tracks mastery by that stable card id instead of line order.
+
+Empty lines and lines without `::` are ignored outside block cards.
 
 ## Directory Structure
 
-Grimoire expects decks organized in subject directories:
+On first launch, Grimoire asks whether to:
 
+- point to an existing Grimoire vault
+- create a new vault and choose where to save it
+
+New vaults use this layout:
+
+```text
+~/grimoire_knowledge_vault/
+  decks/
+  notes/
+  media/
 ```
-~/knowledge_vault/Study-Vault/Grimoire/
+
+Grimoire currently drills decks from `decks/`. A typical deck layout inside that folder looks like:
+
+```text
+~/grimoire_knowledge_vault/decks/
   networking/
     week_1/
       protocols.txt
@@ -139,7 +194,18 @@ Progress is saved to `~/.local/share/grimoire/progress.json`. This includes:
 
 ## Configuration
 
-Deck directory and data file paths are currently hardcoded at the top of `src/main.cpp`. Ollama endpoint defaults to `http://localhost:11434`.
+On first run, Grimoire writes config to `~/.config/grimoire/config.json` and stores:
+
+- `vault_root`: the root of your Grimoire knowledge vault
+
+The deck directory is derived as `vault_root/decks`.
+
+Progress and session state remain local app data:
+
+- `~/.local/share/grimoire/progress.json`
+- `~/.local/share/grimoire/session.json`
+
+Ollama defaults to `http://localhost:11434`.
 
 ## Feature Plan
 
