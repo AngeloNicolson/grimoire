@@ -93,33 +93,42 @@ Empty lines and lines without `::` are ignored outside block cards.
 
 ## Directory Structure
 
-On first launch, Grimoire asks whether to:
+On first launch, Grimoire asks where the parent Grimoire library should live.
 
-- point to an existing Grimoire vault
-- create a new vault and choose where to save it
+The parent library stores shared metadata and a `vaults/` directory. Each child vault is loaded separately, so Grimoire only indexes the active vault instead of everything at once.
 
-New vaults use this layout:
+The default layout is:
 
 ```text
 ~/grimoire_knowledge_vault/
-  decks/
-  notes/
-  media/
+  registry.json
+  vaults/
+    study/
+      decks/
+      notes/
+      media/
+    bible/
+      decks/
+      notes/
+      media/
 ```
 
-Grimoire currently drills decks from `decks/`. A typical deck layout inside that folder looks like:
+Grimoire currently drills decks from the active child vault's `decks/` directory. A typical child vault layout looks like:
 
 ```text
-~/grimoire_knowledge_vault/decks/
-  networking/
-    week_1/
-      protocols.txt
-      access_networks.txt
-    week_2/
-      transport_layer.txt
-  physics/
-    kinematics.txt
-    forces.txt
+~/grimoire_knowledge_vault/vaults/study/
+  decks/
+    networking/
+      week_1/
+        protocols.txt
+        access_networks.txt
+      week_2/
+        transport_layer.txt
+    physics/
+      kinematics.txt
+      forces.txt
+  notes/
+  media/
 ```
 
 The deck browser shows subjects on the left and decks on the right.
@@ -198,9 +207,14 @@ Progress is saved to `~/.local/share/grimoire/progress.json`. This includes:
 
 On first run, Grimoire writes config to `~/.config/grimoire/config.json` and stores:
 
-- `vault_root`: the root of your Grimoire knowledge vault
+- `library_root`: the path to your parent Grimoire library
 
-The deck directory is derived as `vault_root/decks`.
+The parent library itself stores:
+
+- `registry.json`: the current vault and known child vault paths
+- `library_metadata.json`: a generated summary of vaults, decks, completion stats, consistency, streaks, and weak areas
+
+The active deck directory is derived as `current_vault/decks`.
 
 Progress and session state remain local app data:
 
