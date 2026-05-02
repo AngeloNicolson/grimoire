@@ -1499,6 +1499,30 @@ static std::vector<StyledLine> format_display_text(const std::string& text, int 
     return lines;
 }
 
+static std::vector<std::string> format_note_text(const std::string& text, int width)
+{
+    std::vector<std::string> lines;
+    std::istringstream stream(text);
+    std::string line;
+    int safe_width = std::max(1, width);
+
+    while (std::getline(stream, line))
+    {
+        if (line.empty())
+        {
+            lines.push_back("");
+            continue;
+        }
+
+        auto wrapped = wrap_text(line, safe_width);
+        if (wrapped.empty()) wrapped.push_back("");
+        lines.insert(lines.end(), wrapped.begin(), wrapped.end());
+    }
+
+    if (lines.empty()) lines.push_back("");
+    return lines;
+}
+
 static void draw_styled_lines(const std::vector<StyledLine>& lines, int& y, int x, int max_y,
                               int width)
 {
@@ -1556,6 +1580,199 @@ static void draw_box(int y, int x, int h, int w)
     mvaddch(y + h - 1, x, ACS_LLCORNER);
     mvaddch(y + h - 1, x + w - 1, ACS_LRCORNER);
     attroff(COLOR_PAIR(CLR_BORDER));
+}
+
+static void show_blocking_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer);
+static std::string format_elapsed(time_t start);
+
+static void show_note_reader(const std::string& path, const std::string& deck_name,
+                             int round_num, time_t session_start, int queue_left,
+                             int queued_count, int mastered, int total_cards, int stage,
+                             int streak, int card_target)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        show_blocking_message("Note Open Failed",
+                              {"Grimoire could not open this note:", collapse_home(path)},
+                              "[Any key] back");
+        return;
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    std::string note_text = buffer.str();
+
+    int scroll = 0;
+    int last_content_width = -1;
+    std::vector<std::string> rendered_lines;
+
+    while (true)
+    {
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+        std::string elapsed = format_elapsed(session_start);
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(0, 1, "%s", elapsed.c_str());
+        mvprintw(0, (max_x - (int)deck_name.size()) / 2, "%s", deck_name.c_str());
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        char mastered_str[64];
+        snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered, total_cards);
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(0, max_x - (int)strlen(mastered_str) - 1, "%s", mastered_str);
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(1, 1, "[drilling]");
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        char queue_str[128];
+        snprintf(queue_str, sizeof(queue_str), "%d left | %d queued", queue_left, queued_count);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(1, max_x - (int)strlen(queue_str) - 1, "%s", queue_str);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        draw_hline_full(2, 0, max_x);
+
+        char round_str[64];
+        snprintf(round_str, sizeof(round_str), "Round %d", round_num);
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(3, (max_x - (int)strlen(round_str)) / 2, "%s", round_str);
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        draw_hline_full(4, 0, max_x);
+
+        int box_w = std::min(max_x - 6, 72);
+        box_w = std::max(40, box_w);
+        int box_h = std::min(max_y - 8, max_y - 6);
+        box_h = std::max(12, box_h);
+        int box_x = (max_x - box_w) / 2;
+        int box_y = std::max(6, (max_y - box_h) / 2);
+        int inner_x = box_x + 2;
+        int inner_y = box_y + 3;
+        int content_w = std::max(20, box_w - 4);
+        int content_h = std::max(1, box_h - 7);
+
+        if (content_w != last_content_width)
+        {
+            rendered_lines = format_note_text(note_text, content_w);
+            scroll = std::min(scroll, std::max(0, (int)rendered_lines.size() - content_h));
+            last_content_width = content_w;
+        }
+
+        int max_scroll = std::max(0, (int)rendered_lines.size() - content_h);
+        scroll = std::max(0, std::min(scroll, max_scroll));
+
+        draw_box(box_y, box_x, box_h, box_w);
+
+        attron(COLOR_PAIR(stage_color(stage)));
+        mvprintw(box_y, box_x + 2, "[%s]", stage_label(stage));
+        attroff(COLOR_PAIR(stage_color(stage)));
+
+        char streak_str[32];
+        snprintf(streak_str, sizeof(streak_str), "%d/%d", streak, card_target);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(box_y, box_x + box_w - 2 - (int)strlen(streak_str), "%s", streak_str);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        std::string title = fs::path(path).filename().string();
+        if ((int)title.size() > box_w - 6) title = title.substr(0, box_w - 6);
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(box_y + 1, box_x + 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        std::string path_line = collapse_home(path);
+        if ((int)path_line.size() > box_w - 6) path_line = path_line.substr(0, box_w - 6);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(box_y + 2, box_x + 2, "%s", path_line.c_str());
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        draw_hline_full(box_y + 3, box_x + 1, box_w - 2);
+
+        int y = inner_y;
+        for (int i = 0; i < content_h && (i + scroll) < (int)rendered_lines.size(); i++)
+        {
+            mvaddnstr(y, inner_x, rendered_lines[i + scroll].c_str(), content_w);
+            y++;
+        }
+
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 2, 1, "[j/k] Scroll  [g/G] Top/Bottom  [Ctrl-D/U] Half Page  [q] Back");
+        attroff(COLOR_PAIR(CLR_DIM));
+        if (total_cards > 0)
+        {
+            int n = total_cards;
+            int gaps = n - 1;
+            int usable = max_x - gaps;
+            int base_w = usable / n;
+            int extra = usable % n;
+            if (base_w < 1)
+            {
+                base_w = 1;
+                extra = 0;
+            }
+            move(max_y - 1, 0);
+            for (int i = 0; i < n; i++)
+            {
+                int start_extra = (n - extra) / 2;
+                int w = base_w + (i >= start_extra && i < start_extra + extra ? 1 : 0);
+                if (i < mastered)
+                    attron(COLOR_PAIR(CLR_CORRECT));
+                else
+                    attron(COLOR_PAIR(CLR_DIM));
+                for (int j = 0; j < w; j++)
+                    addch(ACS_HLINE);
+                if (i < mastered)
+                    attroff(COLOR_PAIR(CLR_CORRECT));
+                else
+                    attroff(COLOR_PAIR(CLR_DIM));
+                if (i < n - 1) addch(' ');
+            }
+        }
+
+        refresh();
+
+        timeout(-1);
+        int ch = getch();
+        if (ch == 'q' || ch == 27) return;
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            if (scroll < max_scroll) scroll++;
+            continue;
+        }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (scroll > 0) scroll--;
+            continue;
+        }
+        if (ch == 'g')
+        {
+            int next = getch();
+            if (next == 'g')
+                scroll = 0;
+            else
+                ungetch(next);
+            continue;
+        }
+        if (ch == 'G')
+        {
+            scroll = max_scroll;
+            continue;
+        }
+        if (ch == 4 || ch == KEY_NPAGE)
+        {
+            scroll = std::min(max_scroll, scroll + std::max(1, content_h / 2));
+            continue;
+        }
+        if (ch == 21 || ch == KEY_PPAGE)
+        {
+            scroll = std::max(0, scroll - std::max(1, content_h / 2));
+            continue;
+        }
+    }
 }
 
 static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
@@ -1619,7 +1836,9 @@ static void show_blocking_message(const std::string& title, const std::vector<st
     getch();
 }
 
-static void open_note_ref(const Card& card)
+static void open_note_ref(const Card& card, const std::string& deck_name, int round_num,
+                          time_t session_start, int queue_left, int queued_count, int mastered,
+                          int total_cards, int stage, int streak, int card_target)
 {
     if (card.note_ref.empty())
     {
@@ -1637,16 +1856,8 @@ static void open_note_ref(const Card& card)
         return;
     }
 
-    const char* editor = std::getenv("EDITOR");
-    std::string editor_cmd = (editor && *editor) ? editor : "nano";
-    std::string command = editor_cmd + " " + shell_escape(resolved);
-
-    def_prog_mode();
-    endwin();
-    system(command.c_str());
-    reset_prog_mode();
-    refresh();
-    clear();
+    show_note_reader(resolved, deck_name, round_num, session_start, queue_left, queued_count,
+                     mastered, total_cards, stage, streak, card_target);
 }
 
 static bool assign_note_ref_for_card(const std::string& deck_path, std::vector<Card>& session_cards,
@@ -3151,7 +3362,9 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             }
             if (ch == 'n')
             {
-                open_note_ref(card);
+                open_note_ref(card, session.deck_name, session.round_num, session_start,
+                              (int)session.round.size() + 1, (int)session.missed.size(),
+                              mastered, (int)session.cards.size(), stage, streak, card_target);
                 timeout(1000);
                 continue;
             }
