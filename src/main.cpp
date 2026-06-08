@@ -22,13 +22,18 @@ using json = nlohmann::json;
 
 // --- Config ---
 
-static const std::string DEFAULT_VAULT_ROOT = "~/grimoire_knowledge_vault";
+#ifndef GRIMOIRE_VERSION
+#define GRIMOIRE_VERSION "0.2.0"
+#endif
+
+static const std::string DEFAULT_LIBRARY_ROOT = "~/grimoire_knowledge_vault";
 static const std::string CONFIG_FILE = "~/.config/grimoire/config.json";
 static const std::string DEFAULT_DATA_FILE = "~/.local/share/grimoire/progress.json";
 static const std::string DEFAULT_SESSION_FILE = "~/.local/share/grimoire/session.json";
 
-static std::string g_vault_root = DEFAULT_VAULT_ROOT;
-static std::string g_deck_dir = DEFAULT_VAULT_ROOT + "/decks";
+static std::string g_library_root = DEFAULT_LIBRARY_ROOT;
+static std::string g_vault_root;
+static std::string g_deck_dir;
 static std::string g_data_file = DEFAULT_DATA_FILE;
 static std::string g_session_file = DEFAULT_SESSION_FILE;
 
@@ -52,16 +57,313 @@ static std::string collapse_home(const std::string& path)
     return path;
 }
 
+static std::string normalize_path(const std::string& path)
+{
+    if (path.empty()) return "";
+    try
+    {
+        return fs::absolute(expand_home(path)).lexically_normal().string();
+    }
+    catch (...)
+    {
+        return expand_home(path);
+    }
+}
+
+static std::string iso_date(time_t timestamp = time(nullptr))
+{
+    char buf[32];
+    std::tm* local = std::localtime(&timestamp);
+    if (!local) return "";
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", local);
+    return buf;
+}
+
+static int days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int)doe - 719468;
+}
+
+static bool parse_iso_date(const std::string& value, int& year, int& month, int& day)
+{
+    if (value.size() != 10 || value[4] != '-' || value[7] != '-') return false;
+    try
+    {
+        year = std::stoi(value.substr(0, 4));
+        month = std::stoi(value.substr(5, 2));
+        day = std::stoi(value.substr(8, 2));
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+static int iso_date_to_day_number(const std::string& value)
+{
+    int year = 0, month = 0, day = 0;
+    if (!parse_iso_date(value, year, month, day)) return 0;
+    return days_from_civil(year, (unsigned)month, (unsigned)day);
+}
+
+// Inverse of days_from_civil (Howard Hinnant's algorithm): day number -> y/m/d.
+static void civil_from_days(int z, int& y, unsigned& m, unsigned& d)
+{
+    z += 719468;
+    const int era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int yr = (int)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp < 10 ? mp + 3 : mp - 9;
+    y = yr + (m <= 2);
+}
+
+static std::string iso_date_from_day_number(int day_number)
+{
+    int y = 0;
+    unsigned m = 0, d = 0;
+    civil_from_days(day_number, y, m, d);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, (int)m, (int)d);
+    return buf;
+}
+
+// SM-2-lite scheduling. grade: 0 = Again, 1 = Good, 2 = Easy.
+static json sr_update(json entry, int grade, int today_day)
+{
+    double ease = entry.value("ease", 2.5);
+    int interval = entry.value("interval", 0);
+    int reps = entry.value("reps", 0);
+
+    if (grade == 0) // Again
+    {
+        ease = std::max(1.3, ease - 0.2);
+        reps = 0;
+        interval = 1;
+    }
+    else if (grade == 1) // Good
+    {
+        if (reps == 0)
+            interval = 1;
+        else if (reps == 1)
+            interval = 6;
+        else
+            interval = std::max(1, (int)(interval * ease + 0.5));
+        reps += 1;
+    }
+    else // Easy
+    {
+        ease += 0.15;
+        if (reps == 0)
+            interval = 4;
+        else
+            interval = std::max(1, (int)(interval * ease * 1.3 + 0.5));
+        reps += 1;
+    }
+
+    json out;
+    out["ease"] = ease;
+    out["interval"] = interval;
+    out["reps"] = reps;
+    out["due"] = iso_date_from_day_number(today_day + interval);
+    out["last"] = iso_date_from_day_number(today_day);
+    return out;
+}
+
+// Predicted next interval (days) for a grade without mutating state - used for UI previews.
+static int sr_preview_interval(const json& entry, int grade)
+{
+    json copy = entry.is_null() ? json::object() : entry;
+    return sr_update(copy, grade, 0).value("interval", 1);
+}
+
+struct ActivityMetrics
+{
+    int current_streak = 0;
+    int longest_streak = 0;
+    double consistency_rating = 0.0;
+};
+
+static ActivityMetrics compute_activity_metrics(std::vector<std::string> active_dates)
+{
+    ActivityMetrics metrics;
+    std::sort(active_dates.begin(), active_dates.end());
+    active_dates.erase(std::unique(active_dates.begin(), active_dates.end()), active_dates.end());
+
+    int today_day = iso_date_to_day_number(iso_date());
+    int active_last_30 = 0;
+    int previous_day = 0;
+    int run = 0;
+
+    for (const auto& date : active_dates)
+    {
+        int day = iso_date_to_day_number(date);
+        if (day == 0) continue;
+        if (today_day - day >= 0 && today_day - day < 30) active_last_30++;
+
+        if (run == 0 || day != previous_day + 1)
+            run = 1;
+        else
+            run++;
+
+        metrics.longest_streak = std::max(metrics.longest_streak, run);
+        previous_day = day;
+    }
+
+    if (!active_dates.empty())
+    {
+        int last_day = iso_date_to_day_number(active_dates.back());
+        if (last_day == today_day || last_day == today_day - 1)
+        {
+            metrics.current_streak = 1;
+            int expected = last_day;
+            for (int i = (int)active_dates.size() - 2; i >= 0; i--)
+            {
+                int day = iso_date_to_day_number(active_dates[i]);
+                if (day == expected - 1)
+                {
+                    metrics.current_streak++;
+                    expected = day;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    metrics.consistency_rating = active_last_30 * (100.0 / 30.0);
+    return metrics;
+}
+
+struct LibraryRegistry
+{
+    std::string current_vault;
+    std::vector<std::string> known_vaults;
+};
+
+static LibraryRegistry load_library_registry()
+{
+    LibraryRegistry registry;
+    std::ifstream file(fs::path(normalize_path(g_library_root)) / "registry.json");
+    if (!file.is_open()) return registry;
+    try
+    {
+        json data = json::parse(file);
+        registry.current_vault = data.value("current_vault", "");
+        registry.known_vaults = data.value("known_vaults", std::vector<std::string>{});
+    }
+    catch (...)
+    {
+    }
+    return registry;
+}
+
+struct SplashSummary
+{
+    int current_streak = 0;
+    int sessions_completed = 0;
+    int current_vault_decks = 0;
+    double consistency_rating = 0.0;
+    std::string improvement_deck_id;
+};
+
+static SplashSummary load_splash_summary()
+{
+    SplashSummary summary;
+    std::ifstream file(fs::path(normalize_path(g_library_root)) / "library_metadata.json");
+    if (!file.is_open()) return summary;
+    try
+    {
+        json data = json::parse(file);
+        auto vaults = data.value("vaults", json::array());
+        for (const auto& vault : vaults)
+        {
+            if (!vault.is_object()) continue;
+            if (vault.value("path", "") != g_vault_root) continue;
+            summary.current_vault_decks = vault.value("deck_count", 0);
+            json vault_summary = vault.value("summary", json::object());
+            summary.current_streak = vault_summary.value("current_day_streak", 0);
+            summary.sessions_completed = vault_summary.value("sessions_completed", 0);
+            summary.consistency_rating = vault_summary.value("consistency_rating", 0.0);
+            summary.improvement_deck_id = vault_summary.value("focus_deck_id", "");
+            break;
+        }
+
+        if (summary.current_vault_decks == 0)
+        {
+            summary.current_streak = 0;
+            summary.sessions_completed = 0;
+            summary.consistency_rating = 0.0;
+            summary.improvement_deck_id.clear();
+        }
+    }
+    catch (...)
+    {
+    }
+    return summary;
+}
+
 struct AppConfig
 {
-    std::string vault_root;
+    std::string library_root;
+    std::string current_vault;
+    std::vector<std::string> known_vaults;
+
+    std::string registry_path() const
+    {
+        std::string root = library_root.empty() ? normalize_path(DEFAULT_LIBRARY_ROOT) : library_root;
+        return (fs::path(root) / "registry.json").string();
+    }
 
     void apply() const
     {
-        g_vault_root = vault_root.empty() ? DEFAULT_VAULT_ROOT : vault_root;
+        g_library_root = library_root.empty() ? normalize_path(DEFAULT_LIBRARY_ROOT) : library_root;
+        g_vault_root = current_vault;
         g_deck_dir = g_vault_root + "/decks";
         g_data_file = DEFAULT_DATA_FILE;
         g_session_file = DEFAULT_SESSION_FILE;
+    }
+
+    void ensure_consistency()
+    {
+        if (library_root.empty()) library_root = normalize_path(DEFAULT_LIBRARY_ROOT);
+        library_root = normalize_path(library_root);
+
+        if (current_vault.empty() && !known_vaults.empty()) current_vault = known_vaults.front();
+        if (current_vault.empty()) return;
+
+        current_vault = normalize_path(current_vault);
+        bool found = false;
+        for (auto& vault : known_vaults)
+        {
+            vault = normalize_path(vault);
+            if (vault == current_vault) found = true;
+        }
+        if (!found) known_vaults.insert(known_vaults.begin(), current_vault);
+
+        std::sort(known_vaults.begin(), known_vaults.end());
+        known_vaults.erase(std::unique(known_vaults.begin(), known_vaults.end()), known_vaults.end());
+    }
+
+    void set_current_vault(const std::string& path)
+    {
+        current_vault = normalize_path(path);
+        ensure_consistency();
+    }
+
+    void set_library_root(const std::string& path)
+    {
+        library_root = normalize_path(path);
+        ensure_consistency();
     }
 
     bool load()
@@ -69,23 +371,52 @@ struct AppConfig
         std::ifstream file(expand_home(CONFIG_FILE));
         if (!file.is_open()) return false;
 
+        json data;
         try
         {
-            json data = json::parse(file);
-            vault_root = data.value("vault_root", "");
+            data = json::parse(file);
         }
         catch (...)
         {
             return false;
         }
 
-        if (vault_root.empty()) return false;
+        library_root = data.value("library_root", "");
+        if (library_root.empty()) library_root = DEFAULT_LIBRARY_ROOT;
+        library_root = normalize_path(library_root);
+
+        std::ifstream registry_file(registry_path());
+        if (registry_file.is_open())
+        {
+            try
+            {
+                json registry = json::parse(registry_file);
+                current_vault = registry.value("current_vault", "");
+                known_vaults = registry.value("known_vaults", std::vector<std::string>{});
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            current_vault = data.value("current_vault", "");
+            known_vaults = data.value("known_vaults", std::vector<std::string>{});
+            if (current_vault.empty()) current_vault = data.value("vault_root", "");
+        }
+
+        ensure_consistency();
+        if (current_vault.empty()) return false;
         apply();
         return true;
     }
 
     bool save() const
     {
+        AppConfig normalized = *this;
+        normalized.ensure_consistency();
+
         std::string path = expand_home(CONFIG_FILE);
         fs::create_directories(fs::path(path).parent_path());
 
@@ -93,8 +424,17 @@ struct AppConfig
         if (!file.is_open()) return false;
 
         json data;
-        data["vault_root"] = vault_root;
+        data["library_root"] = normalized.library_root;
         file << data.dump(2);
+
+        fs::create_directories(normalized.library_root);
+        std::ofstream registry_file(normalized.registry_path());
+        if (!registry_file.is_open()) return false;
+
+        json registry;
+        registry["current_vault"] = normalized.current_vault;
+        registry["known_vaults"] = normalized.known_vaults;
+        registry_file << registry.dump(2);
         return true;
     }
 };
@@ -123,6 +463,56 @@ struct Deck
     std::string summary;
     std::vector<Card> cards;
 };
+
+static std::string make_note_ref_portable(const std::string& path)
+{
+    if (path.empty()) return "";
+
+    fs::path absolute = fs::absolute(path);
+    fs::path vault_root = fs::absolute(expand_home(g_vault_root));
+
+    std::string abs_str = absolute.lexically_normal().string();
+    std::string root_str = vault_root.lexically_normal().string();
+
+    if (abs_str == root_str) return ".";
+    if (abs_str.size() > root_str.size() && abs_str.compare(0, root_str.size(), root_str) == 0 &&
+        abs_str[root_str.size()] == '/')
+        return abs_str.substr(root_str.size() + 1);
+    return collapse_home(abs_str);
+}
+
+static bool save_deck(const std::string& path, const Deck& deck)
+{
+    std::ofstream file(path);
+    if (!file.is_open()) return false;
+
+    bool has_metadata = !deck.id.empty() || !deck.title.empty();
+    if (has_metadata)
+    {
+        file << "---\n";
+        if (!deck.id.empty()) file << "deck_id: " << deck.id << "\n";
+        if (!deck.title.empty()) file << "title: " << deck.title << "\n";
+        file << "---\n";
+    }
+
+    if (!deck.summary.empty())
+    {
+        file << deck.summary << "\n";
+        file << "---\n";
+    }
+
+    for (size_t i = 0; i < deck.cards.size(); i++)
+    {
+        const auto& card = deck.cards[i];
+        file << "Q:\n" << card.question << "\n";
+        file << "A:\n" << card.answer << "\n";
+        if (!card.id.empty()) file << "ID:\n" << card.id << "\n";
+        if (!card.note_ref.empty()) file << "NOTE:\n" << card.note_ref << "\n";
+        if (i + 1 < deck.cards.size()) file << "\n";
+    }
+
+    return true;
+}
 
 static std::string trim(const std::string& value)
 {
@@ -390,10 +780,28 @@ static std::vector<DeckEntry> list_dir(const std::string& dir)
 
 // --- Progress ---
 
+static std::string deck_id_from_path(const std::string& path, const std::string& root);
+static void write_library_metadata(const struct Progress& progress);
+
+static std::vector<std::string> list_deck_files_recursive(const std::string& root)
+{
+    std::vector<std::string> files;
+    if (root.empty() || !fs::exists(root)) return files;
+    for (auto& entry : fs::recursive_directory_iterator(root))
+    {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == ".txt") files.push_back(entry.path().string());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 struct Progress
 {
     json drill_mastery;
     json deck_stats;
+    json session_history;
+    json schedule; // spaced-repetition schedule keyed by "<deck_id>:<card_key>"
 
     void load()
     {
@@ -403,6 +811,8 @@ struct Progress
         {
             drill_mastery = json::object();
             deck_stats = json::object();
+            session_history = json::array();
+            schedule = json::object();
             return;
         }
         try
@@ -410,11 +820,15 @@ struct Progress
             json data = json::parse(file);
             drill_mastery = data.value("drill_mastery", json::object());
             deck_stats = data.value("deck_stats", json::object());
+            session_history = data.value("session_history", json::array());
+            schedule = data.value("schedule", json::object());
         }
         catch (...)
         {
             drill_mastery = json::object();
             deck_stats = json::object();
+            session_history = json::array();
+            schedule = json::object();
         }
     }
 
@@ -427,17 +841,40 @@ struct Progress
         json data;
         data["drill_mastery"] = drill_mastery;
         data["deck_stats"] = deck_stats;
+        data["session_history"] = session_history;
+        data["schedule"] = schedule;
         file << data.dump(2);
+        write_library_metadata(*this);
     }
 
-    int get_stage(const std::string& deck_id, int card_idx)
+    // Schedule key mirrors the mastery keying: stable card id when present, else index.
+    std::string sched_key(const std::string& deck_id, const std::string& card_key,
+                          int fallback_idx) const
+    {
+        if (!card_key.empty()) return deck_id + ":" + card_key;
+        return deck_id + ":" + std::to_string(fallback_idx);
+    }
+
+    json get_schedule(const std::string& key) const
+    {
+        if (schedule.is_object() && schedule.contains(key)) return schedule[key];
+        return json();
+    }
+
+    void set_schedule(const std::string& key, const json& entry)
+    {
+        if (!schedule.is_object()) schedule = json::object();
+        schedule[key] = entry;
+    }
+
+    int get_stage(const std::string& deck_id, int card_idx) const
     {
         std::string key = deck_id + ":" + std::to_string(card_idx);
         if (drill_mastery.contains(key)) { return drill_mastery[key].get<int>(); }
         return 0;
     }
 
-    int get_stage(const std::string& deck_id, const std::string& card_key, int fallback_idx)
+    int get_stage(const std::string& deck_id, const std::string& card_key, int fallback_idx) const
     {
         if (!card_key.empty())
         {
@@ -463,7 +900,222 @@ struct Progress
         }
         set_stage(deck_id, fallback_idx, stage);
     }
+
+    void record_session(const std::string& vault_root, const std::string& deck_id,
+                        const std::string& deck_path, int card_count, int duration_seconds,
+                        bool completed)
+    {
+        auto& stats = deck_stats[deck_id];
+        if (!stats.is_object()) stats = json::object();
+        if (completed)
+            stats["completed"] = stats.value("completed", 0) + 1;
+        else
+            stats["paused"] = stats.value("paused", 0) + 1;
+
+        json event;
+        event["date"] = iso_date();
+        event["timestamp"] = (long long)time(nullptr);
+        event["vault_root"] = vault_root;
+        event["deck_id"] = deck_id;
+        event["deck_path"] = deck_path;
+        event["card_count"] = card_count;
+        event["duration_seconds"] = duration_seconds;
+        event["result"] = completed ? "completed" : "paused";
+        session_history.push_back(event);
+    }
 };
+
+static json build_library_metadata(const Progress& progress)
+{
+    json metadata;
+    metadata["generated_at"] = (long long)time(nullptr);
+    metadata["generated_date"] = iso_date();
+    metadata["library_root"] = g_library_root;
+
+    LibraryRegistry registry = load_library_registry();
+    metadata["current_vault"] = registry.current_vault;
+
+    int sessions_completed = 0;
+    int sessions_paused = 0;
+    for (auto it = progress.deck_stats.begin(); it != progress.deck_stats.end(); ++it)
+    {
+        const auto& stats = it.value();
+        sessions_completed += stats.value("completed", 0);
+        sessions_paused += stats.value("paused", 0);
+    }
+
+    std::vector<std::string> active_dates;
+    for (const auto& event : progress.session_history)
+    {
+        if (!event.is_object()) continue;
+        std::string date = event.value("date", "");
+        if (!date.empty()) active_dates.push_back(date);
+    }
+    ActivityMetrics library_metrics = compute_activity_metrics(active_dates);
+
+    json improvement = json::array();
+    struct WeakDeck
+    {
+        double mastery_rate = 1.0;
+        int tracked_cards = 0;
+        int strong_cards = 0;
+        std::string deck_id;
+        std::string vault_root;
+    };
+    std::vector<WeakDeck> weak_decks;
+    std::map<std::string, std::vector<WeakDeck>> weak_decks_by_vault;
+
+    json vaults = json::array();
+    int total_decks = 0;
+    for (const auto& vault_root : registry.known_vaults)
+    {
+        json vault;
+        vault["path"] = vault_root;
+        vault["label"] = fs::path(vault_root).filename().string();
+        vault["is_current"] = vault_root == registry.current_vault;
+
+        std::vector<std::string> deck_files = list_deck_files_recursive(vault_root + "/decks");
+        vault["deck_count"] = (int)deck_files.size();
+        total_decks += (int)deck_files.size();
+
+        json decks = json::array();
+        for (const auto& deck_path : deck_files)
+        {
+            Deck deck = parse_deck(deck_path);
+            std::string deck_root = normalize_path(vault_root + "/decks");
+            std::string deck_id = deck.id.empty() ? deck_id_from_path(deck_path, deck_root) : deck.id;
+            int tracked = 0;
+            int strong = 0;
+            for (size_t i = 0; i < deck.cards.size(); i++)
+            {
+                int stage = progress.get_stage(deck_id, deck.cards[i].id, (int)i);
+                tracked++;
+                if (stage >= 2) strong++;
+            }
+
+            auto deck_stat_it = progress.deck_stats.find(deck_id);
+            int completed = 0;
+            int paused = 0;
+            if (deck_stat_it != progress.deck_stats.end())
+            {
+                completed = deck_stat_it.value().value("completed", 0);
+                paused = deck_stat_it.value().value("paused", 0);
+            }
+
+            json deck_entry;
+            deck_entry["id"] = deck_id;
+            deck_entry["title"] =
+                deck.title.empty() ? fs::path(deck_path).stem().string() : deck.title;
+            deck_entry["path"] = deck_path;
+            deck_entry["card_count"] = (int)deck.cards.size();
+            deck_entry["strong_cards"] = strong;
+            deck_entry["mastery_rate"] = tracked > 0 ? (double)strong / tracked : 0.0;
+            deck_entry["completed_sessions"] = completed;
+            deck_entry["paused_sessions"] = paused;
+            decks.push_back(deck_entry);
+
+            if (tracked > 0)
+            {
+                WeakDeck weak{tracked > 0 ? (double)strong / tracked : 0.0, tracked, strong, deck_id,
+                              vault_root};
+                weak_decks.push_back(weak);
+                weak_decks_by_vault[vault_root].push_back(weak);
+            }
+        }
+
+        int vault_sessions_completed = 0;
+        int vault_sessions_paused = 0;
+        std::vector<std::string> vault_dates;
+        for (const auto& event : progress.session_history)
+        {
+            if (!event.is_object()) continue;
+            if (event.value("vault_root", "") != vault_root) continue;
+            std::string result = event.value("result", "");
+            if (result == "completed")
+                vault_sessions_completed++;
+            else if (result == "paused")
+                vault_sessions_paused++;
+
+            std::string date = event.value("date", "");
+            if (!date.empty()) vault_dates.push_back(date);
+        }
+        ActivityMetrics vault_metrics = compute_activity_metrics(vault_dates);
+
+        std::sort(weak_decks_by_vault[vault_root].begin(), weak_decks_by_vault[vault_root].end(),
+                  [](const WeakDeck& a, const WeakDeck& b)
+                  {
+                      if (a.mastery_rate != b.mastery_rate) return a.mastery_rate < b.mastery_rate;
+                      return a.tracked_cards > b.tracked_cards;
+                  });
+
+        std::string focus_deck_id;
+        if (!weak_decks_by_vault[vault_root].empty())
+            focus_deck_id = weak_decks_by_vault[vault_root].front().deck_id;
+
+        vault["summary"] = {
+            {"sessions_completed", vault_sessions_completed},
+            {"sessions_paused", vault_sessions_paused},
+            {"completion_rate",
+             vault_sessions_completed + vault_sessions_paused > 0
+                 ? (double)vault_sessions_completed /
+                       (vault_sessions_completed + vault_sessions_paused)
+                 : 0.0},
+            {"current_day_streak", vault_metrics.current_streak},
+            {"longest_day_streak", vault_metrics.longest_streak},
+            {"consistency_rating", vault_metrics.consistency_rating},
+            {"focus_deck_id", focus_deck_id}};
+        vault["decks"] = decks;
+        vaults.push_back(vault);
+    }
+
+    std::sort(weak_decks.begin(), weak_decks.end(),
+              [](const WeakDeck& a, const WeakDeck& b)
+              {
+                  if (a.mastery_rate != b.mastery_rate) return a.mastery_rate < b.mastery_rate;
+                  return a.tracked_cards > b.tracked_cards;
+              });
+
+    for (size_t i = 0; i < weak_decks.size() && i < 5; i++)
+    {
+        json item;
+        item["deck_id"] = weak_decks[i].deck_id;
+        item["vault_root"] = weak_decks[i].vault_root;
+        item["mastery_rate"] = weak_decks[i].mastery_rate;
+        item["tracked_cards"] = weak_decks[i].tracked_cards;
+        item["strong_cards"] = weak_decks[i].strong_cards;
+        improvement.push_back(item);
+    }
+
+    metadata["vaults"] = vaults;
+    metadata["summary"] = {
+        {"vault_count", (int)registry.known_vaults.size()},
+        {"deck_count", total_decks},
+        {"sessions_completed", sessions_completed},
+        {"sessions_paused", sessions_paused},
+        {"completion_rate",
+         sessions_completed + sessions_paused > 0
+             ? (double)sessions_completed / (sessions_completed + sessions_paused)
+             : 0.0},
+        {"consistency_rating", library_metrics.consistency_rating},
+        {"current_day_streak", library_metrics.current_streak},
+        {"longest_day_streak", library_metrics.longest_streak},
+        {"areas_of_improvement", improvement}};
+    return metadata;
+}
+
+static void write_library_metadata(const Progress& progress)
+{
+    try
+    {
+        fs::create_directories(g_library_root);
+        std::ofstream file(fs::path(g_library_root) / "library_metadata.json");
+        if (!file.is_open()) return;
+        file << build_library_metadata(progress).dump(2);
+    }
+    catch (...)
+    {
+    }
+}
 
 // --- Drill Logic ---
 
@@ -540,7 +1192,7 @@ struct DrillSession
         return true;
     }
 
-    int mastered_count()
+    int mastered_count() const
     {
         int count = 0;
         for (int i = 0; i < (int)cards.size(); i++)
@@ -583,7 +1235,9 @@ struct DrillSession
         std::string fpath = expand_home(g_session_file);
         std::string dir = fs::path(fpath).parent_path().string();
         fs::create_directories(dir);
+        json all_sessions = load_all_sessions();
         json j;
+        j["vault_root"] = g_vault_root;
         j["deck_path"] = path;
         j["deck_id"] = deck_id;
         j["deck_name"] = deck_name;
@@ -593,8 +1247,9 @@ struct DrillSession
         j["targets"] = targets;
         j["round_num"] = round_num;
         j["elapsed"] = elapsed;
+        all_sessions[g_vault_root] = j;
         std::ofstream file(fpath);
-        file << j.dump(2);
+        file << all_sessions.dump(2);
     }
 
     // Restore session state from saved data
@@ -614,22 +1269,49 @@ struct DrillSession
     static void clear_session()
     {
         std::string fpath = expand_home(g_session_file);
-        if (fs::exists(fpath)) fs::remove(fpath);
+        if (!fs::exists(fpath)) return;
+        json all_sessions = load_all_sessions();
+        all_sessions.erase(g_vault_root);
+        if (all_sessions.empty())
+        {
+            fs::remove(fpath);
+            return;
+        }
+        std::ofstream file(fpath);
+        file << all_sessions.dump(2);
+    }
+
+    static json load_all_sessions()
+    {
+        std::string fpath = expand_home(g_session_file);
+        std::ifstream file(fpath);
+        if (!file.is_open()) return json::object();
+        try
+        {
+            json parsed = json::parse(file);
+            if (parsed.is_object() && parsed.contains("deck_name"))
+            {
+                json migrated = json::object();
+                std::string vault_root = parsed.value("vault_root", "");
+                if (!vault_root.empty())
+                    migrated[vault_root] = parsed;
+                return migrated;
+            }
+            if (parsed.is_object()) return parsed;
+            return json::object();
+        }
+        catch (...)
+        {
+            return json::object();
+        }
     }
 
     static json load_session()
     {
-        std::string fpath = expand_home(g_session_file);
-        std::ifstream file(fpath);
-        if (!file.is_open()) return json();
-        try
-        {
-            return json::parse(file);
-        }
-        catch (...)
-        {
-            return json();
-        }
+        json all_sessions = load_all_sessions();
+        if (!all_sessions.is_object()) return json();
+        if (!all_sessions.contains(g_vault_root)) return json();
+        return all_sessions[g_vault_root];
     }
 };
 
@@ -920,6 +1602,30 @@ static std::vector<StyledLine> format_display_text(const std::string& text, int 
     return lines;
 }
 
+static std::vector<std::string> format_note_text(const std::string& text, int width)
+{
+    std::vector<std::string> lines;
+    std::istringstream stream(text);
+    std::string line;
+    int safe_width = std::max(1, width);
+
+    while (std::getline(stream, line))
+    {
+        if (line.empty())
+        {
+            lines.push_back("");
+            continue;
+        }
+
+        auto wrapped = wrap_text(line, safe_width);
+        if (wrapped.empty()) wrapped.push_back("");
+        lines.insert(lines.end(), wrapped.begin(), wrapped.end());
+    }
+
+    if (lines.empty()) lines.push_back("");
+    return lines;
+}
+
 static void draw_styled_lines(const std::vector<StyledLine>& lines, int& y, int x, int max_y,
                               int width)
 {
@@ -979,6 +1685,209 @@ static void draw_box(int y, int x, int h, int w)
     attroff(COLOR_PAIR(CLR_BORDER));
 }
 
+static void show_blocking_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer);
+static std::string format_elapsed(time_t start);
+
+static void show_note_reader(const std::string& path, const std::string& deck_name,
+                             int round_num, time_t session_start, int queue_left,
+                             int queued_count, int mastered, int total_cards, int stage,
+                             int streak, int card_target)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        show_blocking_message("Note Open Failed",
+                              {"Grimoire could not open this note:", collapse_home(path)},
+                              "[Any key] back");
+        return;
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    std::string note_text = buffer.str();
+
+    int scroll = 0;
+    int last_content_width = -1;
+    std::vector<std::string> rendered_lines;
+
+    while (true)
+    {
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+        std::string elapsed = format_elapsed(session_start);
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(0, 1, "%s", elapsed.c_str());
+        mvprintw(0, (max_x - (int)deck_name.size()) / 2, "%s", deck_name.c_str());
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        char mastered_str[64];
+        snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered, total_cards);
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(0, max_x - (int)strlen(mastered_str) - 1, "%s", mastered_str);
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        attron(COLOR_PAIR(CLR_HEADER));
+        mvprintw(1, 1, "[drilling]");
+        attroff(COLOR_PAIR(CLR_HEADER));
+
+        char queue_str[128];
+        snprintf(queue_str, sizeof(queue_str), "%d left | %d queued", queue_left, queued_count);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(1, max_x - (int)strlen(queue_str) - 1, "%s", queue_str);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        draw_hline_full(2, 0, max_x);
+
+        char round_str[64];
+        snprintf(round_str, sizeof(round_str), "Round %d", round_num);
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(3, (max_x - (int)strlen(round_str)) / 2, "%s", round_str);
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        draw_hline_full(4, 0, max_x);
+
+        int box_w = std::min(max_x - 6, 72);
+        box_w = std::max(40, box_w);
+        int box_h = std::min(max_y - 8, max_y - 6);
+        box_h = std::max(12, box_h);
+        int box_x = (max_x - box_w) / 2;
+        int box_y = std::max(6, (max_y - box_h) / 2);
+        int inner_x = box_x + 2;
+        int inner_y = box_y + 3;
+        int content_w = std::max(20, box_w - 4);
+        int content_h = std::max(1, box_h - 7);
+
+        if (content_w != last_content_width)
+        {
+            rendered_lines = format_note_text(note_text, content_w);
+            scroll = std::min(scroll, std::max(0, (int)rendered_lines.size() - content_h));
+            last_content_width = content_w;
+        }
+
+        int max_scroll = std::max(0, (int)rendered_lines.size() - content_h);
+        scroll = std::max(0, std::min(scroll, max_scroll));
+
+        draw_box(box_y, box_x, box_h, box_w);
+
+        attron(COLOR_PAIR(stage_color(stage)));
+        mvprintw(box_y, box_x + 2, "[%s]", stage_label(stage));
+        attroff(COLOR_PAIR(stage_color(stage)));
+
+        char streak_str[32];
+        snprintf(streak_str, sizeof(streak_str), "%d/%d", streak, card_target);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(box_y, box_x + box_w - 2 - (int)strlen(streak_str), "%s", streak_str);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        std::string title = fs::path(path).filename().string();
+        if ((int)title.size() > box_w - 6) title = title.substr(0, box_w - 6);
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(box_y + 1, box_x + 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        std::string path_line = collapse_home(path);
+        if ((int)path_line.size() > box_w - 6) path_line = path_line.substr(0, box_w - 6);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(box_y + 2, box_x + 2, "%s", path_line.c_str());
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        draw_hline_full(box_y + 3, box_x + 1, box_w - 2);
+
+        int y = inner_y;
+        for (int i = 0; i < content_h && (i + scroll) < (int)rendered_lines.size(); i++)
+        {
+            mvaddnstr(y, inner_x, rendered_lines[i + scroll].c_str(), content_w);
+            y++;
+        }
+
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 2, 1, "[j/k] Scroll  [g/G] Top/Bottom  [Ctrl-D/U] Half Page  [q] Back");
+        attroff(COLOR_PAIR(CLR_DIM));
+        if (total_cards > 0)
+        {
+            int n = total_cards;
+            int gaps = n - 1;
+            int usable = max_x - gaps;
+            int base_w = usable / n;
+            int extra = usable % n;
+            if (base_w < 1)
+            {
+                base_w = 1;
+                extra = 0;
+            }
+            move(max_y - 1, 0);
+            for (int i = 0; i < n; i++)
+            {
+                int start_extra = (n - extra) / 2;
+                int w = base_w + (i >= start_extra && i < start_extra + extra ? 1 : 0);
+                if (i < mastered)
+                    attron(COLOR_PAIR(CLR_CORRECT));
+                else
+                    attron(COLOR_PAIR(CLR_DIM));
+                for (int j = 0; j < w; j++)
+                    addch(ACS_HLINE);
+                if (i < mastered)
+                    attroff(COLOR_PAIR(CLR_CORRECT));
+                else
+                    attroff(COLOR_PAIR(CLR_DIM));
+                if (i < n - 1) addch(' ');
+            }
+        }
+
+        refresh();
+
+        timeout(-1);
+        int ch = getch();
+        if (ch == 'q' || ch == 27) return;
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            if (scroll < max_scroll) scroll++;
+            continue;
+        }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (scroll > 0) scroll--;
+            continue;
+        }
+        if (ch == 'g')
+        {
+            int next = getch();
+            if (next == 'g')
+                scroll = 0;
+            else
+                ungetch(next);
+            continue;
+        }
+        if (ch == 'G')
+        {
+            scroll = max_scroll;
+            continue;
+        }
+        if (ch == 4 || ch == KEY_NPAGE)
+        {
+            scroll = std::min(max_scroll, scroll + std::max(1, content_h / 2));
+            continue;
+        }
+        if (ch == 21 || ch == KEY_PPAGE)
+        {
+            scroll = std::max(0, scroll - std::max(1, content_h / 2));
+            continue;
+        }
+    }
+}
+
+static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer = "");
+static std::string prompt_path_screen(const std::string& title, const std::vector<std::string>& lines,
+                                      const std::string& default_value);
+static std::string prompt_text_screen(const std::string& title, const std::vector<std::string>& lines,
+                                      const std::string& label, const std::string& default_value);
+static void ensure_library_dirs(const std::string& library_root);
+static void ensure_vault_dirs(const std::string& vault_root);
+static bool run_first_time_setup(AppConfig& config);
+
 // --- AI ---
 
 static const std::string OLLAMA_URL = "http://localhost:11434";
@@ -995,6 +1904,107 @@ static std::string shell_escape(const std::string& s)
     }
     out += "'";
     return out;
+}
+
+static std::string strip_note_anchor(const std::string& note_ref)
+{
+    size_t hash = note_ref.find('#');
+    if (hash == std::string::npos) return note_ref;
+    return note_ref.substr(0, hash);
+}
+
+static std::string resolve_note_ref_path(const std::string& note_ref)
+{
+    std::string base = trim(strip_note_anchor(note_ref));
+    if (base.empty()) return "";
+
+    std::string expanded = expand_home(base);
+    if (fs::exists(expanded)) return expanded;
+
+    fs::path vault_root = expand_home(g_vault_root);
+    fs::path candidate = vault_root / base;
+    if (fs::exists(candidate)) return candidate.string();
+
+    candidate = vault_root / "notes" / base;
+    if (fs::exists(candidate)) return candidate.string();
+
+    return "";
+}
+
+static void show_blocking_message(const std::string& title, const std::vector<std::string>& lines,
+                                  const std::string& footer = "[Any key] back")
+{
+    timeout(-1);
+    draw_centered_message(title, lines, footer);
+    getch();
+}
+
+static void open_note_ref(const Card& card, const std::string& deck_name, int round_num,
+                          time_t session_start, int queue_left, int queued_count, int mastered,
+                          int total_cards, int stage, int streak, int card_target)
+{
+    if (card.note_ref.empty())
+    {
+        show_blocking_message("No Note Reference",
+                              {"This card does not have a linked note."});
+        return;
+    }
+
+    std::string resolved = resolve_note_ref_path(card.note_ref);
+    if (resolved.empty())
+    {
+        show_blocking_message("Note Not Found",
+                              {"Grimoire could not resolve this note reference:",
+                               card.note_ref});
+        return;
+    }
+
+    show_note_reader(resolved, deck_name, round_num, session_start, queue_left, queued_count,
+                     mastered, total_cards, stage, streak, card_target);
+}
+
+static bool assign_note_ref_for_card(const std::string& deck_path, std::vector<Card>& session_cards,
+                                     int card_idx)
+{
+    if (card_idx < 0 || card_idx >= (int)session_cards.size()) return false;
+
+    Card& card = session_cards[card_idx];
+    std::string default_value = card.note_ref.empty() ? expand_home(g_vault_root) : card.note_ref;
+
+    std::string input = prompt_path_screen(
+        "Attach Note",
+        {"Enter the note path to attach to this card.",
+         "If the note is inside your vault, Grimoire will save it as a vault-relative path."},
+        default_value);
+
+    if (input.empty()) return false;
+
+    std::string trimmed_input = trim(input);
+    std::string stored_ref = trimmed_input;
+    std::string maybe_path = expand_home(trimmed_input);
+
+    if (fs::exists(maybe_path)) stored_ref = make_note_ref_portable(maybe_path);
+
+    Deck deck = parse_deck(deck_path);
+    if (card_idx >= (int)deck.cards.size())
+    {
+        show_blocking_message("Attach Failed",
+                              {"The deck changed on disk and the current card could not be updated."});
+        return false;
+    }
+
+    deck.cards[card_idx].note_ref = stored_ref;
+    if (!save_deck(deck_path, deck))
+    {
+        show_blocking_message("Save Failed",
+                              {"Grimoire could not write the updated deck file."});
+        return false;
+    }
+
+    card.note_ref = stored_ref;
+    show_blocking_message("Note Attached",
+                          {"This card is now linked to:", stored_ref});
+    return true;
 }
 
 static std::string query_ollama(const std::string& model, const Card& card, const std::string& deck,
@@ -1072,9 +2082,16 @@ static std::string get_loaded_model()
     return model;
 }
 
-static std::string get_input(int y, int x, int max_w)
+struct TextInputResult
+{
+    std::string value;
+    bool cancelled = false;
+};
+
+static TextInputResult get_input_result(int y, int x, int max_w)
 {
     std::string input;
+    bool cancelled = false;
     curs_set(1);
     timeout(-1);
     while (true)
@@ -1086,18 +2103,23 @@ static std::string get_input(int y, int x, int max_w)
         if (ch == '\n' || ch == KEY_ENTER) break;
         if (ch == 27)
         {
-            input.clear();
+            cancelled = true;
             break;
         }
         if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty()) { input.pop_back(); }
         else if (ch >= 32 && ch < 127 && (int)input.size() < max_w - 4) { input += (char)ch; }
     }
     curs_set(0);
-    return input;
+    return {input, cancelled};
+}
+
+static std::string get_input(int y, int x, int max_w)
+{
+    return get_input_result(y, x, max_w).value;
 }
 
 static void draw_centered_message(const std::string& title, const std::vector<std::string>& lines,
-                                  const std::string& footer = "")
+                                  const std::string& footer)
 {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
@@ -1140,9 +2162,33 @@ static std::string prompt_path_screen(const std::string& title, const std::vecto
     if (!default_value.empty()) prompt += " [" + collapse_home(default_value) + "]";
     mvprintw(max_y - 4, 3, "%s", prompt.c_str());
 
-    std::string input = get_input(max_y - 3, 3, std::max(20, max_x - 6));
-    if (input.empty()) return default_value;
-    return input;
+    TextInputResult result = get_input_result(max_y - 3, 3, std::max(20, max_x - 6));
+    if (result.cancelled) return "";
+    if (result.value.empty()) return default_value;
+    return result.value;
+}
+
+static std::string prompt_text_screen(const std::string& title, const std::vector<std::string>& lines,
+                                      const std::string& label, const std::string& default_value)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    draw_centered_message(title, lines, "[Enter] confirm  [Esc] cancel");
+
+    std::string prompt = label;
+    if (!default_value.empty()) prompt += " [" + default_value + "]";
+    mvprintw(max_y - 4, 3, "%s", prompt.c_str());
+
+    TextInputResult result = get_input_result(max_y - 3, 3, std::max(20, max_x - 6));
+    if (result.cancelled) return "";
+    if (result.value.empty()) return default_value;
+    return result.value;
+}
+
+static void ensure_library_dirs(const std::string& library_root)
+{
+    fs::create_directories(library_root);
+    fs::create_directories(fs::path(library_root) / "vaults");
 }
 
 static void ensure_vault_dirs(const std::string& vault_root)
@@ -1152,89 +2198,268 @@ static void ensure_vault_dirs(const std::string& vault_root)
     fs::create_directories(fs::path(vault_root) / "media");
 }
 
-static bool run_first_time_setup()
+static std::string default_child_vault_root(const AppConfig& config)
+{
+    std::string library_root =
+        config.library_root.empty() ? normalize_path(DEFAULT_LIBRARY_ROOT) : config.library_root;
+    return (fs::path(library_root) / "vaults").string();
+}
+
+static std::string vault_display_name_for_paths(const std::string& library_root,
+                                                const std::string& vault_path)
+{
+    std::string normalized_library = normalize_path(library_root);
+    std::string normalized_vault = normalize_path(vault_path);
+    if (normalized_vault.empty()) return "(none)";
+
+    fs::path child_root = fs::path(normalized_library) / "vaults";
+    fs::path vault = normalized_vault;
+
+    std::string child_root_str = child_root.lexically_normal().string();
+    std::string vault_str = vault.lexically_normal().string();
+
+    if (vault_str == child_root_str) return "vaults";
+    if (vault_str.size() > child_root_str.size() &&
+        vault_str.compare(0, child_root_str.size(), child_root_str) == 0 &&
+        vault_str[child_root_str.size()] == '/')
+        return "vaults/" + vault.lexically_relative(child_root).string();
+
+    return collapse_home(vault_str);
+}
+
+static std::string vault_display_name(const AppConfig& config, const std::string& vault_path)
+{
+    return vault_display_name_for_paths(config.library_root, vault_path);
+}
+
+static bool configure_library_root(AppConfig& config, const std::string& suggested_path)
+{
+    std::string path = prompt_path_screen(
+        "Grimoire Library",
+        {"Choose where the parent Grimoire library should live.",
+         "This root stores shared metadata and a vaults/ directory for child vaults."},
+        suggested_path);
+    if (path.empty()) return false;
+
+    path = normalize_path(path);
+    try
+    {
+        ensure_library_dirs(path);
+    }
+    catch (...)
+    {
+        draw_centered_message("Create Failed",
+                              {"Grimoire could not create the library at that location."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+
+    config.set_library_root(path);
+    return true;
+}
+
+static bool configure_existing_vault(AppConfig& config, const std::string& suggested_path)
+{
+    std::string path = prompt_path_screen(
+        "Existing Vault",
+        {"Enter the path to an existing child vault.",
+         "If the vault is missing decks/, Grimoire will create the standard folders there."},
+        suggested_path);
+    if (path.empty()) return false;
+
+    path = normalize_path(path);
+    if (!fs::exists(path) || !fs::is_directory(path))
+    {
+        draw_centered_message("Invalid Path",
+                              {"That path does not exist or is not a directory."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+
+    ensure_vault_dirs(path);
+    config.set_current_vault(path);
+    if (!config.save())
+    {
+        draw_centered_message("Config Error",
+                              {"Grimoire could not save its configuration file."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+    config.apply();
+    return true;
+}
+
+static bool create_new_vault(AppConfig& config, const std::string& suggested_name)
+{
+    std::string vault_name = trim(prompt_text_screen(
+        "New Vault",
+        {"Enter a name for the new child vault.",
+         "Grimoire will create it under the parent library's vaults/ directory."},
+        "Name", suggested_name));
+    if (vault_name.empty()) return false;
+
+    fs::path path = fs::path(default_child_vault_root(config)) / vault_name;
+    path = path.lexically_normal();
+
+    try
+    {
+        ensure_library_dirs(config.library_root);
+        ensure_vault_dirs(path.string());
+    }
+    catch (...)
+    {
+        draw_centered_message("Create Failed",
+                              {"Grimoire could not create the vault at that location."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+
+    config.set_current_vault(path.string());
+    if (!config.save())
+    {
+        draw_centered_message("Config Error",
+                              {"Grimoire could not save its configuration file."},
+                              "[Any key] back");
+        getch();
+        return false;
+    }
+    config.apply();
+    return true;
+}
+
+static bool run_first_time_setup(AppConfig& config)
 {
     while (true)
     {
         draw_centered_message(
             "Welcome To Grimoire",
-            {"Choose where your Grimoire knowledge vault should live.",
-             "An existing vault can be selected by path, or Grimoire can create a new one for you.",
-             "A new vault uses a simple structure: decks/, notes/, and media/."},
-            "[e] existing vault  [n] new vault  [q] quit");
+            {"Choose where your parent Grimoire library should live.",
+             "The library stores shared metadata and keeps child vaults in vaults/.",
+             "Each child vault stays self-contained with decks/, notes/, and media/."},
+            "[s] set library  [q] quit");
 
         int ch = getch();
         if (ch == 'q' || ch == 27) return false;
+        if (ch != 's') continue;
 
-        if (ch == 'e')
+        if (!configure_library_root(config, expand_home(DEFAULT_LIBRARY_ROOT))) continue;
+
+        while (true)
         {
-            std::string path = prompt_path_screen(
-                "Existing Vault",
-                {"Enter the path to your existing Grimoire vault.",
-                 "If the vault is missing decks/, Grimoire will create the standard folders there."},
-                expand_home(DEFAULT_VAULT_ROOT));
-            if (path.empty()) continue;
+            draw_centered_message(
+                "Choose First Vault",
+                {"Create a new child vault under the library, or register an existing vault path.",
+                 "Grimoire only loads one child vault at a time."},
+                "[e] existing vault  [n] new vault  [q] back");
 
-            path = expand_home(path);
-            if (!fs::exists(path) || !fs::is_directory(path))
+            int vault_ch = getch();
+            if (vault_ch == 'q' || vault_ch == 27) break;
+            if (vault_ch == 'e' &&
+                configure_existing_vault(config, default_child_vault_root(config)))
+                return true;
+            if (vault_ch == 'n' && create_new_vault(config, "study")) return true;
+        }
+    }
+}
+
+static bool manage_vaults(AppConfig& config)
+{
+    int selected = 0;
+    int scroll = 0;
+
+    while (true)
+    {
+        config.ensure_consistency();
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        std::string title = "Vaults";
+        mvprintw(0, (max_x - (int)title.size()) / 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        draw_hline_full(1, 0, max_x);
+
+        std::vector<std::string> lines = config.known_vaults;
+        int visible = std::max(1, max_y - 6);
+        if (selected >= (int)lines.size()) selected = std::max(0, (int)lines.size() - 1);
+        if (selected < scroll) scroll = selected;
+        if (selected >= scroll + visible) scroll = selected - visible + 1;
+
+        int y = 3;
+        if (lines.empty())
+        {
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(y, 3, "No configured vaults yet.");
+            attroff(COLOR_PAIR(CLR_DIM));
+        }
+        else
+        {
+            for (int i = 0; i < visible && (i + scroll) < (int)lines.size(); i++)
             {
-                draw_centered_message("Invalid Path",
-                                      {"That path does not exist or is not a directory."},
-                                      "[Any key] back");
-                getch();
-                continue;
+                int idx = i + scroll;
+                std::string display = vault_display_name(config, lines[idx]);
+                if (lines[idx] == config.current_vault) display += " [current]";
+
+                if (idx == selected)
+                {
+                    attron(COLOR_PAIR(CLR_HIGHLIGHT));
+                    mvprintw(y + i, 3, "%-*s", max_x - 6, display.c_str());
+                    attroff(COLOR_PAIR(CLR_HIGHLIGHT));
+                }
+                else
+                {
+                    mvprintw(y + i, 3, "%s", display.c_str());
+                }
             }
+        }
 
-            ensure_vault_dirs(path);
+        draw_hline_full(max_y - 2, 0, max_x);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 1, 1,
+                 "[j/k] navigate  [Enter] switch  [a] add existing  [n] new vault  [q] back");
+        attroff(COLOR_PAIR(CLR_DIM));
+        attron(COLOR_PAIR(CLR_DIM));
+        std::string library_line = "Library: " + collapse_home(config.library_root);
+        mvprintw(2, 3, "%s", library_line.c_str());
+        attroff(COLOR_PAIR(CLR_DIM));
+        refresh();
 
-            AppConfig config;
-            config.vault_root = path;
-            if (!config.save())
+        int ch = getch();
+        if (ch == 'q' || ch == 27) return false;
+        if ((ch == 'j' || ch == KEY_DOWN) && selected < (int)lines.size() - 1) selected++;
+        if ((ch == 'k' || ch == KEY_UP) && selected > 0) selected--;
+
+        if (ch == '\n' || ch == KEY_ENTER)
+        {
+            if (!lines.empty())
             {
-                draw_centered_message("Config Error",
-                                      {"Grimoire could not save its configuration file."},
-                                      "[Any key] back");
-                getch();
-                continue;
+                config.set_current_vault(lines[selected]);
+                if (config.save())
+                {
+                    config.apply();
+                    return true;
+                }
+                show_blocking_message("Config Error",
+                                      {"Grimoire could not save the selected vault."});
             }
-            config.apply();
-            return true;
+        }
+
+        if (ch == 'a')
+        {
+            std::string suggested = !config.current_vault.empty() ? config.current_vault
+                                                                  : default_child_vault_root(config);
+            if (configure_existing_vault(config, suggested)) return true;
         }
 
         if (ch == 'n')
         {
-            std::string path = prompt_path_screen(
-                "New Vault",
-                {"Enter where the new Grimoire vault should be created."},
-                expand_home(DEFAULT_VAULT_ROOT));
-            if (path.empty()) continue;
-
-            path = expand_home(path);
-            try
-            {
-                ensure_vault_dirs(path);
-            }
-            catch (...)
-            {
-                draw_centered_message("Create Failed",
-                                      {"Grimoire could not create the vault at that location."},
-                                      "[Any key] back");
-                getch();
-                continue;
-            }
-
-            AppConfig config;
-            config.vault_root = path;
-            if (!config.save())
-            {
-                draw_centered_message("Config Error",
-                                      {"Grimoire could not save its configuration file."},
-                                      "[Any key] back");
-                getch();
-                continue;
-            }
-            config.apply();
-            return true;
+            if (create_new_vault(config, "study")) return true;
         }
     }
 }
@@ -1521,14 +2746,16 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
 
 // Startup splash screen — random logo variant
 // Returns 'c' to continue paused session, or anything else to browse
-static int show_splash()
+static int show_splash(int due_count)
 {
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> dist(0, LOGO_COUNT - 1);
     auto& logo = LOGOS[dist(rng)];
 
     auto saved = DrillSession::load_session();
-    bool has_session = saved.contains("deck_name");
+    SplashSummary summary = load_splash_summary();
+    bool has_session =
+        saved.contains("deck_name") && saved.value("vault_root", "") == g_vault_root;
 
     timeout(-1);
     int max_y, max_x;
@@ -1549,6 +2776,48 @@ static int show_splash()
 
     int hint_y = start_y + logo.height + 3;
 
+    std::string library_label = "Library: " + collapse_home(g_library_root);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(hint_y, (max_x - (int)library_label.size()) / 2, "%s", library_label.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    hint_y += 2;
+
+    std::string vault_label = "Vault: " + vault_display_name_for_paths(g_library_root, g_vault_root);
+    std::string decks_line = "Decks: " + std::to_string(summary.current_vault_decks);
+    std::string completed_line = "Completed: " + std::to_string(summary.sessions_completed);
+    std::string streak_line = "Streak: " + std::to_string(summary.current_streak) + "d";
+    std::string consistency_line =
+        "Consistency: " + std::to_string((int)(summary.consistency_rating + 0.5)) + "%";
+    std::string focus = summary.improvement_deck_id.empty() ? "Focus: none yet"
+                                                            : "Focus: " + summary.improvement_deck_id;
+    int max_inner_w = std::max(28, max_x - 10);
+    if ((int)focus.size() > max_inner_w - 4) focus = focus.substr(0, max_inner_w - 7) + "...";
+
+    int card_inner_w = std::max((int)vault_label.size(), (int)decks_line.size());
+    card_inner_w = std::max(card_inner_w, (int)completed_line.size());
+    card_inner_w = std::max(card_inner_w, (int)streak_line.size());
+    card_inner_w = std::max(card_inner_w, (int)consistency_line.size());
+    card_inner_w = std::max(card_inner_w, (int)focus.size());
+    card_inner_w = std::min(card_inner_w, max_inner_w - 2);
+    int card_w = card_inner_w + 4;
+    int card_h = 8;
+    int card_x = (max_x - card_w) / 2;
+    int card_y = hint_y;
+
+    draw_box(card_y, card_x, card_h, card_w);
+
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(card_y + 1, card_x + (card_w - (int)vault_label.size()) / 2, "%s", vault_label.c_str());
+    mvprintw(card_y + 2, card_x + 2, "%s", decks_line.c_str());
+    mvprintw(card_y + 3, card_x + 2, "%s", completed_line.c_str());
+    mvprintw(card_y + 4, card_x + 2, "%s", streak_line.c_str());
+    mvprintw(card_y + 5, card_x + 2, "%s", consistency_line.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    attron(COLOR_PAIR(CLR_HEADER));
+    mvprintw(card_y + 6, card_x + 2, "%s", focus.c_str());
+    attroff(COLOR_PAIR(CLR_HEADER));
+    hint_y = card_y + card_h + 1;
+
     if (has_session)
     {
         std::string dname = saved["deck_name"].get<std::string>();
@@ -1562,7 +2831,17 @@ static int show_splash()
         hint_y += 2;
     }
 
-    std::string hint = "[Enter] Browse decks  [q] Quit";
+    if (due_count > 0)
+    {
+        char rev[64];
+        snprintf(rev, sizeof(rev), "[r] Review due (%d)", due_count);
+        attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        mvprintw(hint_y, (max_x - (int)strlen(rev)) / 2, "%s", rev);
+        attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        hint_y += 2;
+    }
+
+    std::string hint = "[Enter] Browse decks  [v] Vaults  [q] Quit";
     attron(COLOR_PAIR(CLR_DIM));
     mvprintw(hint_y, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
     attroff(COLOR_PAIR(CLR_DIM));
@@ -1573,6 +2852,8 @@ static int show_splash()
     {
         int ch = getch();
         if (ch == 'q' || ch == 27) return 'q';
+        if (ch == 'v') return 'v';
+        if (ch == 'r' && due_count > 0) return 'r';
         if (ch == 'c' && has_session) return 'c';
         if (ch == '\n' || ch == ' ' || !has_session) return '\n';
     }
@@ -1998,6 +3279,46 @@ static std::string format_elapsed(time_t start)
     return buf;
 }
 
+static void draw_drill_header(const DrillSession& session, time_t session_start, int queue_left,
+                              int queued_count)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+
+    int mastered = session.mastered_count();
+    std::string elapsed = format_elapsed(session_start);
+    attron(COLOR_PAIR(CLR_HEADER));
+    mvprintw(0, 1, "%s", elapsed.c_str());
+    mvprintw(0, (max_x - (int)session.deck_name.size()) / 2, "%s", session.deck_name.c_str());
+    attroff(COLOR_PAIR(CLR_HEADER));
+
+    char mastered_str[64];
+    snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered, (int)session.cards.size());
+    attron(COLOR_PAIR(CLR_HEADER));
+    mvprintw(0, max_x - (int)strlen(mastered_str) - 1, "%s", mastered_str);
+    attroff(COLOR_PAIR(CLR_HEADER));
+
+    attron(COLOR_PAIR(CLR_HEADER));
+    mvprintw(1, 1, "[drilling]");
+    attroff(COLOR_PAIR(CLR_HEADER));
+
+    char queue_str[128];
+    snprintf(queue_str, sizeof(queue_str), "%d left | %d queued", queue_left, queued_count);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, max_x - (int)strlen(queue_str) - 1, "%s", queue_str);
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    draw_hline_full(2, 0, max_x);
+
+    char round_str[64];
+    snprintf(round_str, sizeof(round_str), "Round %d", session.round_num);
+    attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+    mvprintw(3, (max_x - (int)strlen(round_str)) / 2, "%s", round_str);
+    attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+    draw_hline_full(4, 0, max_x);
+}
+
 // Returns true if completed, false if paused/quit
 static bool run_drill(DrillSession& session, const std::string& deck_path, int elapsed_offset = 0)
 {
@@ -2041,6 +3362,10 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 refresh();
                 timeout(-1); // block for final screen
                 getch();
+                int elapsed = (int)difftime(time(nullptr), session_start);
+                session.progress->record_session(g_vault_root, session.deck_id, deck_path,
+                                                (int)session.cards.size(), elapsed, true);
+                session.progress->save();
                 DrillSession::clear_session();
                 return true;
             }
@@ -2060,47 +3385,9 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
             clear();
-
-            // Line 0: timer, deck name centered, mastered right
             int mastered = session.mastered_count();
-            std::string elapsed = format_elapsed(session_start);
-            attron(COLOR_PAIR(CLR_HEADER));
-            mvprintw(0, 1, "%s", elapsed.c_str());
-            mvprintw(0, (max_x - (int)session.deck_name.size()) / 2, "%s",
-                     session.deck_name.c_str());
-            attroff(COLOR_PAIR(CLR_HEADER));
-
-            char mastered_str[64];
-            snprintf(mastered_str, sizeof(mastered_str), "%d/%d", mastered,
-                     (int)session.cards.size());
-            attron(COLOR_PAIR(CLR_HEADER));
-            mvprintw(0, max_x - (int)strlen(mastered_str) - 1, "%s", mastered_str);
-            attroff(COLOR_PAIR(CLR_HEADER));
-
-            // Line 1: [drilling] left, queue right
-            attron(COLOR_PAIR(CLR_HEADER));
-            mvprintw(1, 1, "[drilling]");
-            attroff(COLOR_PAIR(CLR_HEADER));
-
-            char queue_str[128];
-            snprintf(queue_str, sizeof(queue_str), "%d left | %d queued",
-                     (int)session.round.size() + 1, (int)session.missed.size());
-            attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(1, max_x - (int)strlen(queue_str) - 1, "%s", queue_str);
-            attroff(COLOR_PAIR(CLR_DIM));
-
-            // Line 2: separator
-            draw_hline_full(2, 0, max_x);
-
-            // Line 3: Round centered
-            char round_str[64];
-            snprintf(round_str, sizeof(round_str), "Round %d", session.round_num);
-            attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
-            mvprintw(3, (max_x - (int)strlen(round_str)) / 2, "%s", round_str);
-            attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
-
-            // Line 4: separator
-            draw_hline_full(4, 0, max_x);
+            draw_drill_header(session, session_start, (int)session.round.size() + 1,
+                              (int)session.missed.size());
 
             // Card box - centered
             int content_w = std::min(max_x - 6, 60);
@@ -2132,7 +3419,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Hints then progress bar at very bottom
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [n] Open Note  [N] Set Note  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
             if (total_cards_q > 0)
@@ -2174,6 +3461,9 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             {
                 session.round.push_back(card_idx); // put card back
                 int elapsed = (int)difftime(time(nullptr), session_start);
+                session.progress->record_session(g_vault_root, session.deck_id, deck_path,
+                                                (int)session.cards.size(), elapsed, false);
+                session.progress->save();
                 session.save_session(deck_path, elapsed);
                 timeout(-1);
                 return false;
@@ -2181,6 +3471,20 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             if (ch == 'a')
             {
                 show_ai_assistant(card, session.deck_name);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'n')
+            {
+                open_note_ref(card, session.deck_name, session.round_num, session_start,
+                              (int)session.round.size() + 1, (int)session.missed.size(),
+                              mastered, (int)session.cards.size(), stage, streak, card_target);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'N')
+            {
+                assign_note_ref_for_card(deck_path, session.cards, card_idx);
                 timeout(1000);
                 continue;
             }
@@ -2193,29 +3497,9 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
             clear();
-
-            // Top status bar
             int mastered = session.mastered_count();
-            attron(COLOR_PAIR(CLR_DIM));
-            char status_left[128];
-            snprintf(status_left, sizeof(status_left), "%d/%d mastered", mastered,
-                     (int)session.cards.size());
-            mvprintw(0, 1, "%s", status_left);
-
-            char status_mid[64];
-            snprintf(status_mid, sizeof(status_mid), "Round %d", session.round_num);
-            attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
-            mvprintw(0, (max_x - (int)strlen(status_mid)) / 2, "%s", status_mid);
-            attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
-
-            attron(COLOR_PAIR(CLR_DIM));
-            char status_right[128];
-            snprintf(status_right, sizeof(status_right), "%d left | %d queued",
-                     (int)session.round.size(), (int)session.missed.size());
-            mvprintw(0, max_x - (int)strlen(status_right) - 1, "%s", status_right);
-            attroff(COLOR_PAIR(CLR_DIM));
-
-            draw_hline_full(1, 0, max_x);
+            draw_drill_header(session, session_start, (int)session.round.size(),
+                              (int)session.missed.size());
 
             // Card box - centered, with question and answer
             int content_w = std::min(max_x - 6, 60);
@@ -2264,7 +3548,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             mvprintw(max_y - 3, 20, "[n] No (drop)");
             attroff(COLOR_PAIR(CLR_WRONG));
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[N] Set Note  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_a = (int)session.cards.size();
             if (total_cards_a > 0)
@@ -2296,6 +3580,9 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             {
                 session.round.push_back(card_idx); // put card back
                 int elapsed = (int)difftime(time(nullptr), session_start);
+                session.progress->record_session(g_vault_root, session.deck_id, deck_path,
+                                                (int)session.cards.size(), elapsed, false);
+                session.progress->save();
                 session.save_session(deck_path, elapsed);
                 timeout(-1);
                 return false;
@@ -2303,6 +3590,12 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             if (ch == 'a')
             {
                 show_ai_assistant(card, session.deck_name);
+                timeout(1000);
+                continue;
+            }
+            if (ch == 'N')
+            {
+                assign_note_ref_for_card(deck_path, session.cards, card_idx);
                 timeout(1000);
                 continue;
             }
@@ -2320,8 +3613,314 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
     }
 }
 
+// --- Spaced repetition review ---
+
+struct ReviewItem
+{
+    std::string deck_id;
+    std::string deck_path;
+    std::string card_key; // stable card id (may be empty -> index-keyed)
+    int card_idx = 0;
+    Card card;
+    bool is_new = false;
+    int due_day = 0;
+};
+
+// Scan every deck in the active vault and collect cards that are due today (or earlier),
+// plus up to new_limit never-scheduled "new" cards. Due cards come first, oldest-due first.
+static std::vector<ReviewItem> build_review_queue(const Progress& progress, int new_limit = 20)
+{
+    std::vector<ReviewItem> due_items;
+    std::vector<ReviewItem> new_items;
+    std::string deck_root = normalize_path(expand_home(g_deck_dir));
+    int today = iso_date_to_day_number(iso_date());
+
+    for (const auto& deck_path : list_deck_files_recursive(deck_root))
+    {
+        Deck deck = parse_deck(deck_path);
+        if (deck.cards.empty()) continue;
+        std::string deck_id = deck.id.empty() ? deck_id_from_path(deck_path, deck_root) : deck.id;
+        for (size_t i = 0; i < deck.cards.size(); i++)
+        {
+            ReviewItem item;
+            item.deck_id = deck_id;
+            item.deck_path = deck_path;
+            item.card_key = deck.cards[i].id;
+            item.card_idx = (int)i;
+            item.card = deck.cards[i];
+
+            std::string key = progress.sched_key(deck_id, deck.cards[i].id, (int)i);
+            json entry = progress.get_schedule(key);
+            if (entry.is_null())
+            {
+                item.is_new = true;
+                item.due_day = today;
+                new_items.push_back(item);
+            }
+            else
+            {
+                int dd = iso_date_to_day_number(entry.value("due", ""));
+                if (dd <= today)
+                {
+                    item.is_new = false;
+                    item.due_day = dd;
+                    due_items.push_back(item);
+                }
+            }
+        }
+    }
+
+    std::sort(due_items.begin(), due_items.end(),
+              [](const ReviewItem& a, const ReviewItem& b) { return a.due_day < b.due_day; });
+    if (new_limit >= 0 && (int)new_items.size() > new_limit) new_items.resize(new_limit);
+
+    std::vector<ReviewItem> queue = std::move(due_items);
+    for (auto& it : new_items) queue.push_back(it);
+    return queue;
+}
+
+static void draw_review_header(const ReviewItem& item, int idx, int total, int reviewed,
+                               int again_count, time_t session_start)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+
+    attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+    mvprintw(1, 2, "REVIEW");
+    attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+    std::string dname = item.deck_id;
+    auto slash = dname.rfind('/');
+    if (slash != std::string::npos) dname = dname.substr(slash + 1);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, 12, "%s", dname.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    char stat[96];
+    snprintf(stat, sizeof(stat), "card %d/%d  again %d  %s", idx + 1, total, again_count,
+             format_elapsed(session_start).c_str());
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, max_x - (int)strlen(stat) - 2, "%s", stat);
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    int filled = total > 0 ? (reviewed * max_x) / total : 0;
+    move(2, 0);
+    for (int i = 0; i < max_x; i++)
+    {
+        bool on = i < filled;
+        attron(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+        addch(ACS_HLINE);
+        attroff(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+    }
+}
+
+// Cross-deck spaced-repetition review. Each due card is shown once, graded Again/Good/Easy,
+// rescheduled via SM-2, and persisted immediately so quitting mid-review keeps progress.
+static void run_review(std::vector<ReviewItem>& items, Progress& progress)
+{
+    if (items.empty()) return;
+    time_t session_start = time(nullptr);
+    int total = (int)items.size();
+    int reviewed = 0;
+    int again_count = 0;
+    int today = iso_date_to_day_number(iso_date());
+    timeout(1000); // refresh elapsed timer
+
+    for (int idx = 0; idx < total; idx++)
+    {
+        ReviewItem& item = items[idx];
+        std::string key = progress.sched_key(item.deck_id, item.card_key, item.card_idx);
+        json entry = progress.get_schedule(key);
+        bool quit = false;
+
+        // --- Question phase ---
+        bool reveal = false;
+        while (!reveal && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_review_header(item, idx, total, reviewed, again_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DEFAULT, false);
+            int card_h = std::min((int)q_lines.size() + 6, std::max(6, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[review]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            if (ch == ' ') reveal = true;
+        }
+        if (quit) break;
+
+        // --- Answer + grade phase ---
+        bool graded = false;
+        while (!graded && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_review_header(item, idx, total, reviewed, again_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DIM, false);
+            auto a_lines = format_display_text(item.card.answer, content_w - 4, CLR_DEFAULT, true);
+            int card_h = std::min((int)q_lines.size() + (int)a_lines.size() + 8,
+                                  std::max(8, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[review]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+            y++;
+            attron(COLOR_PAIR(CLR_BORDER));
+            mvhline(y, box_x + 1, ACS_HLINE, content_w - 2);
+            attroff(COLOR_PAIR(CLR_BORDER));
+            y += 2;
+            draw_styled_lines(a_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            char again_s[24], good_s[24], easy_s[24];
+            snprintf(again_s, sizeof(again_s), "[1] Again %dd", sr_preview_interval(entry, 0));
+            snprintf(good_s, sizeof(good_s), "[2] Good %dd", sr_preview_interval(entry, 1));
+            snprintf(easy_s, sizeof(easy_s), "[3] Easy %dd", sr_preview_interval(entry, 2));
+            attron(COLOR_PAIR(CLR_WRONG));
+            mvprintw(max_y - 3, 1, "%s", again_s);
+            attroff(COLOR_PAIR(CLR_WRONG));
+            attron(COLOR_PAIR(CLR_CORRECT));
+            mvprintw(max_y - 3, 18, "%s", good_s);
+            attroff(COLOR_PAIR(CLR_CORRECT));
+            attron(COLOR_PAIR(CLR_HEADER));
+            mvprintw(max_y - 3, 34, "%s", easy_s);
+            attroff(COLOR_PAIR(CLR_HEADER));
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            int grade = -1;
+            if (ch == '1') grade = 0;
+            else if (ch == '2' || ch == ' ') grade = 1;
+            else if (ch == '3') grade = 2;
+            if (grade < 0) continue;
+
+            json updated = sr_update(entry.is_null() ? json::object() : entry, grade, today);
+            progress.set_schedule(key, updated);
+            // Keep the mastery stage loosely in sync so dashboards reflect review work.
+            if (grade == 0)
+            {
+                int st = progress.get_stage(item.deck_id, item.card_key, item.card_idx);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, std::max(st - 1, 0));
+            }
+            else
+            {
+                int reps = updated.value("reps", 0);
+                int st = reps >= 3 ? 2 : (reps >= 1 ? 1 : 0);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, st);
+            }
+            progress.save();
+            if (grade == 0) again_count++;
+            reviewed++;
+            graded = true;
+        }
+        if (quit) break;
+    }
+
+    timeout(-1);
+    bool completed = (reviewed >= total);
+    progress.record_session(g_vault_root, "__review__", "", total,
+                            (int)difftime(time(nullptr), session_start), completed);
+    progress.save();
+
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    clear();
+    int box_w = 44, box_h = 9;
+    int box_x = (max_x - box_w) / 2;
+    int box_y = (max_y - box_h) / 2;
+    draw_box(box_y, box_x, box_h, box_w);
+    attron(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    std::string msg = "REVIEW COMPLETE";
+    mvprintw(box_y + 2, box_x + (box_w - (int)msg.size()) / 2, "%s", msg.c_str());
+    attroff(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%d reviewed   %d to relearn", reviewed, again_count);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(box_y + 4, box_x + (box_w - (int)strlen(buf)) / 2, "%s", buf);
+    std::string hint = "[Press any key]";
+    mvprintw(box_y + 6, box_x + (box_w - (int)hint.size()) / 2, "%s", hint.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    refresh();
+    getch();
+}
+
 int main(int argc, char* argv[])
 {
+    // Headless CLI handling (no ncurses) for scripting and package-manager tests.
+    if (argc > 1)
+    {
+        std::string arg = argv[1];
+        if (arg == "--version" || arg == "-v")
+        {
+            printf("grimoire %s\n", GRIMOIRE_VERSION);
+            return 0;
+        }
+        if (arg == "--help" || arg == "-h")
+        {
+            printf("grimoire %s - terminal flashcard drill with spaced repetition\n\n",
+                   GRIMOIRE_VERSION);
+            printf("Usage: grimoire [command]\n\n");
+            printf("With no command, launches the interactive TUI.\n\n");
+            printf("Commands:\n");
+            printf("  --due, review-count   Print the number of cards due for review\n");
+            printf("  --version, -v         Print version\n");
+            printf("  --help, -h            Show this help\n");
+            return 0;
+        }
+        if (arg == "--due" || arg == "review-count")
+        {
+            AppConfig config;
+            if (!config.load())
+            {
+                printf("0\n");
+                return 0;
+            }
+            Progress progress;
+            progress.load();
+            auto queue = build_review_queue(progress);
+            printf("%d\n", (int)queue.size());
+            return 0;
+        }
+        fprintf(stderr, "grimoire: unknown option '%s' (try --help)\n", arg.c_str());
+        return 1;
+    }
+
     // Init ncurses
     setlocale(LC_ALL, "");
     initscr();
@@ -2335,23 +3934,33 @@ int main(int argc, char* argv[])
     AppConfig config;
     if (!config.load())
     {
-        if (!run_first_time_setup())
+        if (!run_first_time_setup(config))
         {
             endwin();
             return 0;
         }
     }
 
-    std::string deck_root = expand_home(g_deck_dir);
-
     // Load progress
     Progress progress;
     progress.load();
+    write_library_metadata(progress);
 
     while (true)
     {
-        int splash_ch = show_splash();
+        std::vector<ReviewItem> review_queue = build_review_queue(progress);
+        int splash_ch = show_splash((int)review_queue.size());
         if (splash_ch == 'q') break;
+        if (splash_ch == 'v')
+        {
+            manage_vaults(config);
+            continue;
+        }
+        if (splash_ch == 'r')
+        {
+            run_review(review_queue, progress);
+            continue;
+        }
 
         // Resume paused session
         if (splash_ch == 'c')
@@ -2377,6 +3986,7 @@ int main(int argc, char* argv[])
         // Normal browse flow
         while (true)
         {
+            std::string deck_root = expand_home(g_deck_dir);
             std::string deck_path = browse_decks(deck_root);
             if (deck_path.empty()) break;
 

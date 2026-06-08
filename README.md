@@ -93,33 +93,42 @@ Empty lines and lines without `::` are ignored outside block cards.
 
 ## Directory Structure
 
-On first launch, Grimoire asks whether to:
+On first launch, Grimoire asks where the parent Grimoire library should live.
 
-- point to an existing Grimoire vault
-- create a new vault and choose where to save it
+The parent library stores shared metadata and a `vaults/` directory. Each child vault is loaded separately, so Grimoire only indexes the active vault instead of everything at once.
 
-New vaults use this layout:
+The default layout is:
 
 ```text
 ~/grimoire_knowledge_vault/
-  decks/
-  notes/
-  media/
+  registry.json
+  vaults/
+    study/
+      decks/
+      notes/
+      media/
+    bible/
+      decks/
+      notes/
+      media/
 ```
 
-Grimoire currently drills decks from `decks/`. A typical deck layout inside that folder looks like:
+Grimoire currently drills decks from the active child vault's `decks/` directory. A typical child vault layout looks like:
 
 ```text
-~/grimoire_knowledge_vault/decks/
-  networking/
-    week_1/
-      protocols.txt
-      access_networks.txt
-    week_2/
-      transport_layer.txt
-  physics/
-    kinematics.txt
-    forces.txt
+~/grimoire_knowledge_vault/vaults/study/
+  decks/
+    networking/
+      week_1/
+        protocols.txt
+        access_networks.txt
+      week_2/
+        transport_layer.txt
+    physics/
+      kinematics.txt
+      forces.txt
+  notes/
+  media/
 ```
 
 The deck browser shows subjects on the left and decks on the right.
@@ -138,8 +147,10 @@ The deck browser shows subjects on the left and decks on the right.
 | Key | Action |
 |-----|--------|
 | `Space` | Show answer |
+| `n` | Open linked note for the current card while viewing the question |
+| `N` | Set or update the linked note for the current card |
 | `y` | Correct (streak +1) |
-| `n` | Wrong (stage drops, streak resets) |
+| `n` | Wrong on the answer screen (stage drops, streak resets) |
 | `a` | Ask AI about this card |
 | `q` | Quit session |
 
@@ -149,6 +160,22 @@ The deck browser shows subjects on the left and decks on the right.
 | `Enter` | Type a question |
 | `j`/`k` | Scroll response |
 | `q`/`Esc` | Back to card |
+
+### Review (Spaced Repetition)
+From the splash screen, `[r] Review due (N)` starts a cross-deck review of every card due today (plus up to 20 new cards), oldest-due first.
+
+| Key | Action |
+|-----|--------|
+| `Space` | Show answer |
+| `1` | Again — reset, see again tomorrow |
+| `2` | Good — schedule at the next interval |
+| `3` | Easy — schedule at a longer interval |
+| `a` | Ask AI about this card |
+| `q` | Quit review (graded cards are saved) |
+
+Each grade shows its resulting interval (e.g. `[2] Good 6d`). Scheduling uses an SM-2-lite algorithm: intervals grow as `1d → 6d → interval × ease`, with ease rising on Easy and falling on Again. Review sessions count toward your daily streak.
+
+Run `grimoire --due` to print the number of cards due (handy for status bars).
 
 ## Installation
 
@@ -191,14 +218,20 @@ Progress is saved to `~/.local/share/grimoire/progress.json`. This includes:
 
 - **drill_mastery**: Per-card mastery stages (persists across sessions)
 - **deck_stats**: Session completion/abandonment counts per deck
+- **schedule**: Per-card spaced-repetition state (`due`, `interval`, `ease`, `reps`, `last`)
 
 ## Configuration
 
 On first run, Grimoire writes config to `~/.config/grimoire/config.json` and stores:
 
-- `vault_root`: the root of your Grimoire knowledge vault
+- `library_root`: the path to your parent Grimoire library
 
-The deck directory is derived as `vault_root/decks`.
+The parent library itself stores:
+
+- `registry.json`: the current vault and known child vault paths
+- `library_metadata.json`: a generated summary of vaults, decks, completion stats, consistency, streaks, and weak areas
+
+The active deck directory is derived as `current_vault/decks`.
 
 Progress and session state remain local app data:
 
@@ -242,7 +275,7 @@ Ollama defaults to `http://localhost:11434`.
 
 ### Future
 - [ ] Multiple card formats (markdown tables, CSV)
-- [ ] Spaced repetition scheduling (optional alternative to drill mode)
+- [x] Spaced repetition scheduling (cross-deck "Review due" with SM-2-lite)
 - [ ] Sync progress across machines
 - [ ] Export stats
 
