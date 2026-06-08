@@ -2,7 +2,7 @@ class Grimoire < Formula
   desc "Terminal-based flashcard drill system with persistent mastery tracking"
   homepage "https://github.com/AngeloNicolson/grimoire"
   url "https://github.com/AngeloNicolson/grimoire/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "TODO_FILL_AFTER_TAG"
+  sha256 "9a6459229d9c0711ae9510a5ae802b8061e384ac505c98c00d8e33ab3fb67283"
   license "MIT"
 
   depends_on "cmake" => :build
