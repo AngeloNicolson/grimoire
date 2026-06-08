@@ -161,6 +161,22 @@ The deck browser shows subjects on the left and decks on the right.
 | `j`/`k` | Scroll response |
 | `q`/`Esc` | Back to card |
 
+### Review (Spaced Repetition)
+From the splash screen, `[r] Review due (N)` starts a cross-deck review of every card due today (plus up to 20 new cards), oldest-due first.
+
+| Key | Action |
+|-----|--------|
+| `Space` | Show answer |
+| `1` | Again — reset, see again tomorrow |
+| `2` | Good — schedule at the next interval |
+| `3` | Easy — schedule at a longer interval |
+| `a` | Ask AI about this card |
+| `q` | Quit review (graded cards are saved) |
+
+Each grade shows its resulting interval (e.g. `[2] Good 6d`). Scheduling uses an SM-2-lite algorithm: intervals grow as `1d → 6d → interval × ease`, with ease rising on Easy and falling on Again. Review sessions count toward your daily streak.
+
+Run `grimoire --due` to print the number of cards due (handy for status bars).
+
 ## Installation
 
 ### Quick install (Linux/macOS)
@@ -202,6 +218,7 @@ Progress is saved to `~/.local/share/grimoire/progress.json`. This includes:
 
 - **drill_mastery**: Per-card mastery stages (persists across sessions)
 - **deck_stats**: Session completion/abandonment counts per deck
+- **schedule**: Per-card spaced-repetition state (`due`, `interval`, `ease`, `reps`, `last`)
 
 ## Configuration
 
@@ -258,7 +275,7 @@ Ollama defaults to `http://localhost:11434`.
 
 ### Future
 - [ ] Multiple card formats (markdown tables, CSV)
-- [ ] Spaced repetition scheduling (optional alternative to drill mode)
+- [x] Spaced repetition scheduling (cross-deck "Review due" with SM-2-lite)
 - [ ] Sync progress across machines
 - [ ] Export stats
 

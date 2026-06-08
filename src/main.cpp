@@ -22,6 +22,10 @@ using json = nlohmann::json;
 
 // --- Config ---
 
+#ifndef GRIMOIRE_VERSION
+#define GRIMOIRE_VERSION "0.2.0"
+#endif
+
 static const std::string DEFAULT_LIBRARY_ROOT = "~/grimoire_knowledge_vault";
 static const std::string CONFIG_FILE = "~/.config/grimoire/config.json";
 static const std::string DEFAULT_DATA_FILE = "~/.local/share/grimoire/progress.json";
@@ -106,6 +110,80 @@ static int iso_date_to_day_number(const std::string& value)
     int year = 0, month = 0, day = 0;
     if (!parse_iso_date(value, year, month, day)) return 0;
     return days_from_civil(year, (unsigned)month, (unsigned)day);
+}
+
+// Inverse of days_from_civil (Howard Hinnant's algorithm): day number -> y/m/d.
+static void civil_from_days(int z, int& y, unsigned& m, unsigned& d)
+{
+    z += 719468;
+    const int era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int yr = (int)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp < 10 ? mp + 3 : mp - 9;
+    y = yr + (m <= 2);
+}
+
+static std::string iso_date_from_day_number(int day_number)
+{
+    int y = 0;
+    unsigned m = 0, d = 0;
+    civil_from_days(day_number, y, m, d);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, (int)m, (int)d);
+    return buf;
+}
+
+// SM-2-lite scheduling. grade: 0 = Again, 1 = Good, 2 = Easy.
+static json sr_update(json entry, int grade, int today_day)
+{
+    double ease = entry.value("ease", 2.5);
+    int interval = entry.value("interval", 0);
+    int reps = entry.value("reps", 0);
+
+    if (grade == 0) // Again
+    {
+        ease = std::max(1.3, ease - 0.2);
+        reps = 0;
+        interval = 1;
+    }
+    else if (grade == 1) // Good
+    {
+        if (reps == 0)
+            interval = 1;
+        else if (reps == 1)
+            interval = 6;
+        else
+            interval = std::max(1, (int)(interval * ease + 0.5));
+        reps += 1;
+    }
+    else // Easy
+    {
+        ease += 0.15;
+        if (reps == 0)
+            interval = 4;
+        else
+            interval = std::max(1, (int)(interval * ease * 1.3 + 0.5));
+        reps += 1;
+    }
+
+    json out;
+    out["ease"] = ease;
+    out["interval"] = interval;
+    out["reps"] = reps;
+    out["due"] = iso_date_from_day_number(today_day + interval);
+    out["last"] = iso_date_from_day_number(today_day);
+    return out;
+}
+
+// Predicted next interval (days) for a grade without mutating state - used for UI previews.
+static int sr_preview_interval(const json& entry, int grade)
+{
+    json copy = entry.is_null() ? json::object() : entry;
+    return sr_update(copy, grade, 0).value("interval", 1);
 }
 
 struct ActivityMetrics
@@ -723,6 +801,7 @@ struct Progress
     json drill_mastery;
     json deck_stats;
     json session_history;
+    json schedule; // spaced-repetition schedule keyed by "<deck_id>:<card_key>"
 
     void load()
     {
@@ -733,6 +812,7 @@ struct Progress
             drill_mastery = json::object();
             deck_stats = json::object();
             session_history = json::array();
+            schedule = json::object();
             return;
         }
         try
@@ -741,12 +821,14 @@ struct Progress
             drill_mastery = data.value("drill_mastery", json::object());
             deck_stats = data.value("deck_stats", json::object());
             session_history = data.value("session_history", json::array());
+            schedule = data.value("schedule", json::object());
         }
         catch (...)
         {
             drill_mastery = json::object();
             deck_stats = json::object();
             session_history = json::array();
+            schedule = json::object();
         }
     }
 
@@ -760,8 +842,29 @@ struct Progress
         data["drill_mastery"] = drill_mastery;
         data["deck_stats"] = deck_stats;
         data["session_history"] = session_history;
+        data["schedule"] = schedule;
         file << data.dump(2);
         write_library_metadata(*this);
+    }
+
+    // Schedule key mirrors the mastery keying: stable card id when present, else index.
+    std::string sched_key(const std::string& deck_id, const std::string& card_key,
+                          int fallback_idx) const
+    {
+        if (!card_key.empty()) return deck_id + ":" + card_key;
+        return deck_id + ":" + std::to_string(fallback_idx);
+    }
+
+    json get_schedule(const std::string& key) const
+    {
+        if (schedule.is_object() && schedule.contains(key)) return schedule[key];
+        return json();
+    }
+
+    void set_schedule(const std::string& key, const json& entry)
+    {
+        if (!schedule.is_object()) schedule = json::object();
+        schedule[key] = entry;
     }
 
     int get_stage(const std::string& deck_id, int card_idx) const
@@ -2643,7 +2746,7 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
 
 // Startup splash screen — random logo variant
 // Returns 'c' to continue paused session, or anything else to browse
-static int show_splash()
+static int show_splash(int due_count)
 {
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> dist(0, LOGO_COUNT - 1);
@@ -2728,6 +2831,16 @@ static int show_splash()
         hint_y += 2;
     }
 
+    if (due_count > 0)
+    {
+        char rev[64];
+        snprintf(rev, sizeof(rev), "[r] Review due (%d)", due_count);
+        attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        mvprintw(hint_y, (max_x - (int)strlen(rev)) / 2, "%s", rev);
+        attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
+        hint_y += 2;
+    }
+
     std::string hint = "[Enter] Browse decks  [v] Vaults  [q] Quit";
     attron(COLOR_PAIR(CLR_DIM));
     mvprintw(hint_y, (max_x - (int)hint.size()) / 2, "%s", hint.c_str());
@@ -2740,6 +2853,7 @@ static int show_splash()
         int ch = getch();
         if (ch == 'q' || ch == 27) return 'q';
         if (ch == 'v') return 'v';
+        if (ch == 'r' && due_count > 0) return 'r';
         if (ch == 'c' && has_session) return 'c';
         if (ch == '\n' || ch == ' ' || !has_session) return '\n';
     }
@@ -3499,8 +3613,314 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
     }
 }
 
+// --- Spaced repetition review ---
+
+struct ReviewItem
+{
+    std::string deck_id;
+    std::string deck_path;
+    std::string card_key; // stable card id (may be empty -> index-keyed)
+    int card_idx = 0;
+    Card card;
+    bool is_new = false;
+    int due_day = 0;
+};
+
+// Scan every deck in the active vault and collect cards that are due today (or earlier),
+// plus up to new_limit never-scheduled "new" cards. Due cards come first, oldest-due first.
+static std::vector<ReviewItem> build_review_queue(const Progress& progress, int new_limit = 20)
+{
+    std::vector<ReviewItem> due_items;
+    std::vector<ReviewItem> new_items;
+    std::string deck_root = normalize_path(expand_home(g_deck_dir));
+    int today = iso_date_to_day_number(iso_date());
+
+    for (const auto& deck_path : list_deck_files_recursive(deck_root))
+    {
+        Deck deck = parse_deck(deck_path);
+        if (deck.cards.empty()) continue;
+        std::string deck_id = deck.id.empty() ? deck_id_from_path(deck_path, deck_root) : deck.id;
+        for (size_t i = 0; i < deck.cards.size(); i++)
+        {
+            ReviewItem item;
+            item.deck_id = deck_id;
+            item.deck_path = deck_path;
+            item.card_key = deck.cards[i].id;
+            item.card_idx = (int)i;
+            item.card = deck.cards[i];
+
+            std::string key = progress.sched_key(deck_id, deck.cards[i].id, (int)i);
+            json entry = progress.get_schedule(key);
+            if (entry.is_null())
+            {
+                item.is_new = true;
+                item.due_day = today;
+                new_items.push_back(item);
+            }
+            else
+            {
+                int dd = iso_date_to_day_number(entry.value("due", ""));
+                if (dd <= today)
+                {
+                    item.is_new = false;
+                    item.due_day = dd;
+                    due_items.push_back(item);
+                }
+            }
+        }
+    }
+
+    std::sort(due_items.begin(), due_items.end(),
+              [](const ReviewItem& a, const ReviewItem& b) { return a.due_day < b.due_day; });
+    if (new_limit >= 0 && (int)new_items.size() > new_limit) new_items.resize(new_limit);
+
+    std::vector<ReviewItem> queue = std::move(due_items);
+    for (auto& it : new_items) queue.push_back(it);
+    return queue;
+}
+
+static void draw_review_header(const ReviewItem& item, int idx, int total, int reviewed,
+                               int again_count, time_t session_start)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+
+    attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+    mvprintw(1, 2, "REVIEW");
+    attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+    std::string dname = item.deck_id;
+    auto slash = dname.rfind('/');
+    if (slash != std::string::npos) dname = dname.substr(slash + 1);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, 12, "%s", dname.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    char stat[96];
+    snprintf(stat, sizeof(stat), "card %d/%d  again %d  %s", idx + 1, total, again_count,
+             format_elapsed(session_start).c_str());
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, max_x - (int)strlen(stat) - 2, "%s", stat);
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    int filled = total > 0 ? (reviewed * max_x) / total : 0;
+    move(2, 0);
+    for (int i = 0; i < max_x; i++)
+    {
+        bool on = i < filled;
+        attron(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+        addch(ACS_HLINE);
+        attroff(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+    }
+}
+
+// Cross-deck spaced-repetition review. Each due card is shown once, graded Again/Good/Easy,
+// rescheduled via SM-2, and persisted immediately so quitting mid-review keeps progress.
+static void run_review(std::vector<ReviewItem>& items, Progress& progress)
+{
+    if (items.empty()) return;
+    time_t session_start = time(nullptr);
+    int total = (int)items.size();
+    int reviewed = 0;
+    int again_count = 0;
+    int today = iso_date_to_day_number(iso_date());
+    timeout(1000); // refresh elapsed timer
+
+    for (int idx = 0; idx < total; idx++)
+    {
+        ReviewItem& item = items[idx];
+        std::string key = progress.sched_key(item.deck_id, item.card_key, item.card_idx);
+        json entry = progress.get_schedule(key);
+        bool quit = false;
+
+        // --- Question phase ---
+        bool reveal = false;
+        while (!reveal && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_review_header(item, idx, total, reviewed, again_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DEFAULT, false);
+            int card_h = std::min((int)q_lines.size() + 6, std::max(6, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[review]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            if (ch == ' ') reveal = true;
+        }
+        if (quit) break;
+
+        // --- Answer + grade phase ---
+        bool graded = false;
+        while (!graded && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_review_header(item, idx, total, reviewed, again_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DIM, false);
+            auto a_lines = format_display_text(item.card.answer, content_w - 4, CLR_DEFAULT, true);
+            int card_h = std::min((int)q_lines.size() + (int)a_lines.size() + 8,
+                                  std::max(8, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[review]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+            y++;
+            attron(COLOR_PAIR(CLR_BORDER));
+            mvhline(y, box_x + 1, ACS_HLINE, content_w - 2);
+            attroff(COLOR_PAIR(CLR_BORDER));
+            y += 2;
+            draw_styled_lines(a_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            char again_s[24], good_s[24], easy_s[24];
+            snprintf(again_s, sizeof(again_s), "[1] Again %dd", sr_preview_interval(entry, 0));
+            snprintf(good_s, sizeof(good_s), "[2] Good %dd", sr_preview_interval(entry, 1));
+            snprintf(easy_s, sizeof(easy_s), "[3] Easy %dd", sr_preview_interval(entry, 2));
+            attron(COLOR_PAIR(CLR_WRONG));
+            mvprintw(max_y - 3, 1, "%s", again_s);
+            attroff(COLOR_PAIR(CLR_WRONG));
+            attron(COLOR_PAIR(CLR_CORRECT));
+            mvprintw(max_y - 3, 18, "%s", good_s);
+            attroff(COLOR_PAIR(CLR_CORRECT));
+            attron(COLOR_PAIR(CLR_HEADER));
+            mvprintw(max_y - 3, 34, "%s", easy_s);
+            attroff(COLOR_PAIR(CLR_HEADER));
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            int grade = -1;
+            if (ch == '1') grade = 0;
+            else if (ch == '2' || ch == ' ') grade = 1;
+            else if (ch == '3') grade = 2;
+            if (grade < 0) continue;
+
+            json updated = sr_update(entry.is_null() ? json::object() : entry, grade, today);
+            progress.set_schedule(key, updated);
+            // Keep the mastery stage loosely in sync so dashboards reflect review work.
+            if (grade == 0)
+            {
+                int st = progress.get_stage(item.deck_id, item.card_key, item.card_idx);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, std::max(st - 1, 0));
+            }
+            else
+            {
+                int reps = updated.value("reps", 0);
+                int st = reps >= 3 ? 2 : (reps >= 1 ? 1 : 0);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, st);
+            }
+            progress.save();
+            if (grade == 0) again_count++;
+            reviewed++;
+            graded = true;
+        }
+        if (quit) break;
+    }
+
+    timeout(-1);
+    bool completed = (reviewed >= total);
+    progress.record_session(g_vault_root, "__review__", "", total,
+                            (int)difftime(time(nullptr), session_start), completed);
+    progress.save();
+
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    clear();
+    int box_w = 44, box_h = 9;
+    int box_x = (max_x - box_w) / 2;
+    int box_y = (max_y - box_h) / 2;
+    draw_box(box_y, box_x, box_h, box_w);
+    attron(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    std::string msg = "REVIEW COMPLETE";
+    mvprintw(box_y + 2, box_x + (box_w - (int)msg.size()) / 2, "%s", msg.c_str());
+    attroff(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%d reviewed   %d to relearn", reviewed, again_count);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(box_y + 4, box_x + (box_w - (int)strlen(buf)) / 2, "%s", buf);
+    std::string hint = "[Press any key]";
+    mvprintw(box_y + 6, box_x + (box_w - (int)hint.size()) / 2, "%s", hint.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    refresh();
+    getch();
+}
+
 int main(int argc, char* argv[])
 {
+    // Headless CLI handling (no ncurses) for scripting and package-manager tests.
+    if (argc > 1)
+    {
+        std::string arg = argv[1];
+        if (arg == "--version" || arg == "-v")
+        {
+            printf("grimoire %s\n", GRIMOIRE_VERSION);
+            return 0;
+        }
+        if (arg == "--help" || arg == "-h")
+        {
+            printf("grimoire %s - terminal flashcard drill with spaced repetition\n\n",
+                   GRIMOIRE_VERSION);
+            printf("Usage: grimoire [command]\n\n");
+            printf("With no command, launches the interactive TUI.\n\n");
+            printf("Commands:\n");
+            printf("  --due, review-count   Print the number of cards due for review\n");
+            printf("  --version, -v         Print version\n");
+            printf("  --help, -h            Show this help\n");
+            return 0;
+        }
+        if (arg == "--due" || arg == "review-count")
+        {
+            AppConfig config;
+            if (!config.load())
+            {
+                printf("0\n");
+                return 0;
+            }
+            Progress progress;
+            progress.load();
+            auto queue = build_review_queue(progress);
+            printf("%d\n", (int)queue.size());
+            return 0;
+        }
+        fprintf(stderr, "grimoire: unknown option '%s' (try --help)\n", arg.c_str());
+        return 1;
+    }
+
     // Init ncurses
     setlocale(LC_ALL, "");
     initscr();
@@ -3528,11 +3948,17 @@ int main(int argc, char* argv[])
 
     while (true)
     {
-        int splash_ch = show_splash();
+        std::vector<ReviewItem> review_queue = build_review_queue(progress);
+        int splash_ch = show_splash((int)review_queue.size());
         if (splash_ch == 'q') break;
         if (splash_ch == 'v')
         {
             manage_vaults(config);
+            continue;
+        }
+        if (splash_ch == 'r')
+        {
+            run_review(review_queue, progress);
             continue;
         }
 

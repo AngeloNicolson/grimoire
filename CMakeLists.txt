@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(grimoire VERSION 0.1.0 LANGUAGES CXX)
+project(grimoire VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,7 @@ add_executable(grimoire
   src/main.cpp
 )
 
+target_compile_definitions(grimoire PRIVATE GRIMOIRE_VERSION="${PROJECT_VERSION}")
 target_include_directories(grimoire PRIVATE ${NCURSESW_INCLUDE_DIRS})
 target_link_libraries(grimoire PRIVATE ${NCURSESW_LIBRARIES} nlohmann_json::nlohmann_json)
 
