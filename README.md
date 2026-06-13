@@ -35,7 +35,7 @@ Within a session, cards cycle through rounds:
 Press `a` during a drill to ask an AI about the current card. Grimoire integrates with Ollama for local AI:
 
 - Auto-starts Ollama if not running
-- In-app model picker if no model is loaded
+- In-app model picker, remembered until Grimoire exits or you switch models
 - Card question and answer provided as context automatically
 - Ask follow-up questions or just hit Enter for "Explain this card"
 
@@ -143,9 +143,13 @@ The deck browser shows subjects on the left and decks on the right.
 | `Enter` | Select |
 | `q` | Quit |
 
+If a selected deck has a saved drill, Grimoire asks whether to continue the last
+session or start a new one.
+
 ### Drill
 | Key | Action |
 |-----|--------|
+| `t` | Type an answer and let AI mark it automatically |
 | `Space` | Show answer |
 | `n` | Open linked note for the current card while viewing the question |
 | `N` | Set or update the linked note for the current card |
@@ -158,6 +162,7 @@ The deck browser shows subjects on the left and decks on the right.
 | Key | Action |
 |-----|--------|
 | `Enter` | Type a question |
+| `m` | Choose/load a different model |
 | `j`/`k` | Scroll response |
 | `q`/`Esc` | Back to card |
 
@@ -166,6 +171,7 @@ From the splash screen, `[r] Review due (N)` starts a cross-deck review of every
 
 | Key | Action |
 |-----|--------|
+| `t` | Type an answer and let AI mark it automatically |
 | `Space` | Show answer |
 | `1` | Again — reset, see again tomorrow |
 | `2` | Good — schedule at the next interval |

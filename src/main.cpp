@@ -1247,7 +1247,10 @@ struct DrillSession
         j["targets"] = targets;
         j["round_num"] = round_num;
         j["elapsed"] = elapsed;
-        all_sessions[g_vault_root] = j;
+        j["saved_at"] = (long long)time(nullptr);
+        if (!all_sessions.contains(g_vault_root) || !all_sessions[g_vault_root].is_object())
+            all_sessions[g_vault_root] = json::object();
+        all_sessions[g_vault_root][deck_id] = j;
         std::ofstream file(fpath);
         file << all_sessions.dump(2);
     }
@@ -1266,12 +1269,20 @@ struct DrillSession
         round_num = j["round_num"].get<int>();
     }
 
-    static void clear_session()
+    static void clear_session(const std::string& deck_id = "")
     {
         std::string fpath = expand_home(g_session_file);
         if (!fs::exists(fpath)) return;
         json all_sessions = load_all_sessions();
-        all_sessions.erase(g_vault_root);
+        if (deck_id.empty())
+        {
+            all_sessions.erase(g_vault_root);
+        }
+        else if (all_sessions.contains(g_vault_root) && all_sessions[g_vault_root].is_object())
+        {
+            all_sessions[g_vault_root].erase(deck_id);
+            if (all_sessions[g_vault_root].empty()) all_sessions.erase(g_vault_root);
+        }
         if (all_sessions.empty())
         {
             fs::remove(fpath);
@@ -1293,11 +1304,30 @@ struct DrillSession
             {
                 json migrated = json::object();
                 std::string vault_root = parsed.value("vault_root", "");
-                if (!vault_root.empty())
-                    migrated[vault_root] = parsed;
+                std::string deck_id = parsed.value("deck_id", parsed.value("deck_path", ""));
+                if (!vault_root.empty() && !deck_id.empty())
+                    migrated[vault_root][deck_id] = parsed;
                 return migrated;
             }
-            if (parsed.is_object()) return parsed;
+            if (parsed.is_object())
+            {
+                json migrated = json::object();
+                for (auto it = parsed.begin(); it != parsed.end(); ++it)
+                {
+                    if (!it.value().is_object()) continue;
+                    if (it.value().contains("deck_name"))
+                    {
+                        std::string deck_id =
+                            it.value().value("deck_id", it.value().value("deck_path", ""));
+                        if (!deck_id.empty()) migrated[it.key()][deck_id] = it.value();
+                    }
+                    else
+                    {
+                        migrated[it.key()] = it.value();
+                    }
+                }
+                return migrated;
+            }
             return json::object();
         }
         catch (...)
@@ -1306,12 +1336,31 @@ struct DrillSession
         }
     }
 
-    static json load_session()
+    static json load_session(const std::string& deck_id = "")
     {
         json all_sessions = load_all_sessions();
         if (!all_sessions.is_object()) return json();
         if (!all_sessions.contains(g_vault_root)) return json();
-        return all_sessions[g_vault_root];
+        const json& vault_sessions = all_sessions[g_vault_root];
+        if (!vault_sessions.is_object()) return json();
+        if (!deck_id.empty())
+        {
+            if (!vault_sessions.contains(deck_id)) return json();
+            return vault_sessions[deck_id];
+        }
+        json latest;
+        long long latest_saved_at = -1;
+        for (auto it = vault_sessions.begin(); it != vault_sessions.end(); ++it)
+        {
+            if (!it.value().is_object() || !it.value().contains("deck_name")) continue;
+            long long saved_at = it.value().value("saved_at", 0LL);
+            if (latest.is_null() || saved_at > latest_saved_at)
+            {
+                latest = it.value();
+                latest_saved_at = saved_at;
+            }
+        }
+        return latest.is_null() ? json() : latest;
     }
 };
 
@@ -1574,9 +1623,20 @@ static std::vector<StyledLine> format_display_text(const std::string& text, int 
     {
         if (!block.is_code)
         {
-            auto wrapped = wrap_text(block.text, safe_width);
-            for (const auto& line : wrapped)
-                lines.push_back({{line, text_color, text_bold}});
+            std::istringstream stream(block.text);
+            std::string paragraph_line;
+            while (std::getline(stream, paragraph_line))
+            {
+                if (paragraph_line.empty())
+                {
+                    lines.push_back({{std::string(), text_color, text_bold}});
+                    continue;
+                }
+                auto wrapped = wrap_text(paragraph_line, safe_width);
+                if (wrapped.empty()) wrapped.push_back("");
+                for (const auto& line : wrapped)
+                    lines.push_back({{line, text_color, text_bold}});
+            }
             continue;
         }
 
@@ -1891,6 +1951,7 @@ static bool run_first_time_setup(AppConfig& config);
 // --- AI ---
 
 static const std::string OLLAMA_URL = "http://localhost:11434";
+static std::string g_ai_model;
 
 static std::string shell_escape(const std::string& s)
 {
@@ -2064,6 +2125,84 @@ static std::string query_ollama(const std::string& model, const Card& card, cons
     {
     }
     return "Error: could not parse Ollama response";
+}
+
+struct TypedAnswerJudgement
+{
+    bool valid = false;
+    bool correct = false;
+    std::string feedback;
+};
+
+static std::string extract_json_object(const std::string& value)
+{
+    size_t start = value.find('{');
+    size_t end = value.rfind('}');
+    if (start == std::string::npos || end == std::string::npos || end <= start) return "";
+    return value.substr(start, end - start + 1);
+}
+
+static TypedAnswerJudgement judge_typed_answer(const std::string& model, const Card& card,
+                                               const std::string& deck,
+                                               const std::string& typed_answer)
+{
+    std::string system_prompt =
+        "You grade flashcard answers. Compare the learner's typed answer to the expected answer. "
+        "Accept paraphrases, synonyms, minor typos, and incomplete wording only when the essential "
+        "meaning is present. Mark incorrect when a key fact is missing or contradicted. "
+        "Return only compact JSON with this exact shape: "
+        "{\"correct\":true,\"feedback\":\"short plain text\"}. "
+        "No markdown and no extra text.\n\n"
+        "Deck: " +
+        deck +
+        "\nQuestion: " +
+        card.question +
+        "\nExpected answer: " +
+        card.answer;
+
+    json payload;
+    payload["model"] = model;
+    payload["prompt"] = "Learner answer: " + typed_answer;
+    payload["system"] = system_prompt;
+    payload["stream"] = false;
+
+    std::string cmd = "curl -s -X POST " + OLLAMA_URL +
+                      "/api/generate "
+                      "-H 'Content-Type: application/json' "
+                      "-d " +
+                      shell_escape(payload.dump()) + " 2>/dev/null";
+
+    std::string result;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return {false, false, "Could not run curl for AI grading."};
+    std::array<char, 4096> buf;
+    while (fgets(buf.data(), buf.size(), pipe))
+    {
+        result += buf.data();
+    }
+    pclose(pipe);
+
+    if (result.empty()) return {false, false, "No response from Ollama."};
+
+    try
+    {
+        auto resp = json::parse(result);
+        if (resp.contains("error"))
+            return {false, false, "Ollama error: " + resp["error"].get<std::string>()};
+        if (!resp.contains("response"))
+            return {false, false, "Could not read AI grading response."};
+
+        std::string response = resp["response"].get<std::string>();
+        std::string json_text = extract_json_object(response);
+        if (json_text.empty()) json_text = response;
+        auto verdict = json::parse(json_text);
+        return {true, verdict.value("correct", false), verdict.value("feedback", response)};
+    }
+    catch (...)
+    {
+    }
+
+    return {false, false, "Could not parse AI grading response."};
 }
 
 static std::string get_loaded_model()
@@ -2592,8 +2731,14 @@ static std::string ensure_ollama_ready()
         }
     }
 
+    if (!g_ai_model.empty()) return g_ai_model;
+
     std::string model = get_loaded_model();
-    if (!model.empty()) return model;
+    if (!model.empty())
+    {
+        g_ai_model = model;
+        return g_ai_model;
+    }
 
     // No model loaded, show picker
     model = pick_model();
@@ -2609,7 +2754,28 @@ static std::string ensure_ollama_ready()
     refresh();
     load_model(model);
 
-    return model;
+    g_ai_model = model;
+    return g_ai_model;
+}
+
+static std::string choose_ai_model()
+{
+    std::string model = pick_model();
+    if (model.empty()) return "";
+
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    clear();
+    attron(COLOR_PAIR(CLR_DIM));
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Loading %s...", model.c_str());
+    mvprintw(max_y / 2, (max_x - (int)strlen(buf)) / 2, "%s", buf);
+    attroff(COLOR_PAIR(CLR_DIM));
+    refresh();
+
+    load_model(model);
+    g_ai_model = model;
+    return g_ai_model;
 }
 
 static void show_ai_assistant(const Card& card, const std::string& deck)
@@ -2681,7 +2847,7 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
 
         draw_hline_full(max_y - 3, 0, max_x);
         attron(COLOR_PAIR(CLR_DIM));
-        mvprintw(max_y - 1, 1, "[Enter] ask  [j/k] scroll  [q/Esc] back");
+        mvprintw(max_y - 1, 1, "[Enter] ask  [m] model  [j/k] scroll  [q/Esc] back");
         attroff(COLOR_PAIR(CLR_DIM));
 
         mvprintw(max_y - 2, left, "> ");
@@ -2698,6 +2864,12 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
         if (ch == 'j' || ch == KEY_DOWN)
         {
             scroll++;
+            continue;
+        }
+        if (ch == 'm')
+        {
+            std::string next_model = choose_ai_model();
+            if (!next_model.empty()) model = next_model;
             continue;
         }
         if (ch == 'k' || ch == KEY_UP)
@@ -2741,6 +2913,88 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
             }
             scroll = 0;
         }
+    }
+}
+
+enum class TypedAnswerAction
+{
+    Cancel,
+    Correct,
+    Wrong
+};
+
+static TypedAnswerAction prompt_and_judge_typed_answer(const Card& card, const std::string& deck)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    int content_w = std::min(max_x - 6, 72);
+    int left = (max_x - content_w) / 2;
+
+    draw_centered_message("Type Answer",
+                          {"Type your answer. Grimoire will ask AI to compare it with the saved answer."},
+                          "[Enter] judge  [Esc] cancel");
+    mvprintw(max_y - 4, left, "Answer");
+    TextInputResult typed = get_input_result(max_y - 3, left, content_w);
+    if (typed.cancelled || trim(typed.value).empty()) return TypedAnswerAction::Cancel;
+
+    std::string model = ensure_ollama_ready();
+    if (model.empty()) return TypedAnswerAction::Cancel;
+
+    clear();
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(max_y / 2, (max_x - 16) / 2, "Checking answer...");
+    attroff(COLOR_PAIR(CLR_DIM));
+    refresh();
+
+    TypedAnswerJudgement judgement = judge_typed_answer(model, card, deck, typed.value);
+    bool suggested_correct = judgement.correct;
+
+    while (true)
+    {
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+        content_w = std::min(max_x - 6, 72);
+        left = (max_x - content_w) / 2;
+        int y = 1;
+
+        int title_color = judgement.valid ? (suggested_correct ? CLR_CORRECT : CLR_WRONG) : CLR_WRONG;
+        attron(COLOR_PAIR(title_color) | A_BOLD);
+        std::string title = judgement.valid ? (suggested_correct ? "AI: Correct" : "AI: Needs Review")
+                                            : "AI Check Failed";
+        mvprintw(y, (max_x - (int)title.size()) / 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(title_color) | A_BOLD);
+        y += 2;
+        draw_hline_full(y, 0, max_x);
+        y += 2;
+
+        auto draw_section = [&](const std::string& label, const std::string& text, int color,
+                                bool bold)
+        {
+            if (y >= max_y - 5) return;
+            attron(COLOR_PAIR(color) | A_BOLD);
+            mvprintw(y++, left, "%s", label.c_str());
+            attroff(COLOR_PAIR(color) | A_BOLD);
+            auto lines = format_display_text(text, content_w, color, bold);
+            draw_styled_lines(lines, y, left, max_y - 5, content_w);
+            y++;
+        };
+
+        draw_section("Question", card.question, CLR_DIM, false);
+        draw_section("Your Answer", typed.value, CLR_DEFAULT, false);
+        draw_section("Expected Answer", card.answer, CLR_DEFAULT, true);
+        draw_section(judgement.valid ? "AI Feedback" : "Error", judgement.feedback, title_color, false);
+
+        draw_hline_full(max_y - 2, 0, max_x);
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 1, 1,
+                 judgement.valid ? "[Any key] apply AI mark" : "[Any key] back without marking");
+        attroff(COLOR_PAIR(CLR_DIM));
+        refresh();
+
+        timeout(-1);
+        getch();
+        if (!judgement.valid) return TypedAnswerAction::Cancel;
+        return suggested_correct ? TypedAnswerAction::Correct : TypedAnswerAction::Wrong;
     }
 }
 
@@ -3264,6 +3518,32 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
     }
 }
 
+// Returns 'c' to continue, 'n' to start fresh, or 'q' to go back.
+static int choose_saved_deck_session(const std::string& deck_name, const json& saved)
+{
+    int remaining = 0;
+    if (saved.contains("round") && saved["round"].is_array())
+        remaining += (int)saved["round"].size();
+    if (saved.contains("missed") && saved["missed"].is_array())
+        remaining += (int)saved["missed"].size();
+
+    char state[128];
+    snprintf(state, sizeof(state), "Saved drill: round %d, %d cards left",
+             saved.value("round_num", 1), remaining);
+
+    timeout(-1);
+    while (true)
+    {
+        draw_centered_message("Resume Deck?",
+                              {"A saved drill exists for " + deck_name + ".", state},
+                              "[c] continue last session  [n] new session  [q/Esc] back");
+        int ch = getch();
+        if (ch == 'c' || ch == 'C') return 'c';
+        if (ch == 'n' || ch == 'N') return 'n';
+        if (ch == 'q' || ch == 27) return 'q';
+    }
+}
+
 // Drill TUI - centered card with box
 static std::string format_elapsed(time_t start)
 {
@@ -3366,7 +3646,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 session.progress->record_session(g_vault_root, session.deck_id, deck_path,
                                                 (int)session.cards.size(), elapsed, true);
                 session.progress->save();
-                DrillSession::clear_session();
+                DrillSession::clear_session(session.deck_id);
                 return true;
             }
         }
@@ -3378,6 +3658,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
         int card_target = session.targets[card_idx];
         int streak = session.streaks[card_idx];
         int stage = session.progress->get_stage(session.deck_id, card.id, card_idx);
+        bool card_handled = false;
 
         // --- Show question ---
         while (true)
@@ -3419,7 +3700,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
             // Hints then progress bar at very bottom
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[Space] Show Answer  [n] Open Note  [N] Set Note  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1,
+                     "[t] Type Answer  [Space] Show Answer  [n] Note  [N] Set Note  [a] AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             int total_cards_q = (int)session.cards.size();
             if (total_cards_q > 0)
@@ -3474,6 +3756,25 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 timeout(1000);
                 continue;
             }
+            if (ch == 't')
+            {
+                TypedAnswerAction action =
+                    prompt_and_judge_typed_answer(card, session.deck_name);
+                timeout(1000);
+                if (action == TypedAnswerAction::Correct)
+                {
+                    session.mark_correct(card_idx);
+                    card_handled = true;
+                    break;
+                }
+                if (action == TypedAnswerAction::Wrong)
+                {
+                    session.mark_wrong(card_idx);
+                    card_handled = true;
+                    break;
+                }
+                continue;
+            }
             if (ch == 'n')
             {
                 open_note_ref(card, session.deck_name, session.round_num, session_start,
@@ -3490,6 +3791,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             }
             if (ch == ' ') break;
         }
+        if (card_handled) continue;
 
         // --- Show answer ---
         while (true)
@@ -3732,6 +4034,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
         std::string key = progress.sched_key(item.deck_id, item.card_key, item.card_idx);
         json entry = progress.get_schedule(key);
         bool quit = false;
+        int typed_grade = -1;
 
         // --- Question phase ---
         bool reveal = false;
@@ -3758,7 +4061,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
             draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
 
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(max_y - 2, 1, "[Space] Show Answer  [a] Ask AI  [q] Quit");
+            mvprintw(max_y - 2, 1, "[t] Type Answer  [Space] Show Answer  [a] Ask AI  [q] Quit");
             attroff(COLOR_PAIR(CLR_DIM));
             refresh();
 
@@ -3766,9 +4069,50 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
             if (ch == ERR) continue;
             if (ch == 'q' || ch == 27) { quit = true; break; }
             if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            if (ch == 't')
+            {
+                TypedAnswerAction action =
+                    prompt_and_judge_typed_answer(item.card, item.deck_id);
+                timeout(1000);
+                if (action == TypedAnswerAction::Correct)
+                {
+                    typed_grade = 1;
+                    reveal = true;
+                    break;
+                }
+                if (action == TypedAnswerAction::Wrong)
+                {
+                    typed_grade = 0;
+                    reveal = true;
+                    break;
+                }
+                continue;
+            }
             if (ch == ' ') reveal = true;
         }
         if (quit) break;
+
+        if (typed_grade >= 0)
+        {
+            json updated =
+                sr_update(entry.is_null() ? json::object() : entry, typed_grade, today);
+            progress.set_schedule(key, updated);
+            if (typed_grade == 0)
+            {
+                int st = progress.get_stage(item.deck_id, item.card_key, item.card_idx);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, std::max(st - 1, 0));
+            }
+            else
+            {
+                int reps = updated.value("reps", 0);
+                int st = reps >= 3 ? 2 : (reps >= 1 ? 1 : 0);
+                progress.set_stage(item.deck_id, item.card_key, item.card_idx, st);
+            }
+            progress.save();
+            if (typed_grade == 0) again_count++;
+            reviewed++;
+            continue;
+        }
 
         // --- Answer + grade phase ---
         bool graded = false;
@@ -3927,6 +4271,7 @@ int main(int argc, char* argv[])
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    set_escdelay(25);
     curs_set(0);
 
     if (has_colors()) { init_colors(); }
@@ -3978,6 +4323,8 @@ int main(int argc, char* argv[])
                     run_drill(session, deck_path, elapsed);
                     continue;
                 }
+                DrillSession::clear_session(saved.value("deck_id", ""));
+                continue;
             }
             DrillSession::clear_session();
             continue;
@@ -3999,6 +4346,22 @@ int main(int argc, char* argv[])
             if (slash != std::string::npos) dname = dname.substr(slash + 1);
             std::replace(dname.begin(), dname.end(), '_', ' ');
             std::replace(dname.begin(), dname.end(), '-', ' ');
+
+            auto saved = DrillSession::load_session(deck_id);
+            if (saved.contains("deck_path"))
+            {
+                int action = choose_saved_deck_session(dname, saved);
+                if (action == 'q') continue;
+                if (action == 'c')
+                {
+                    DrillSession session;
+                    session.restore(saved, std::move(deck.cards), &progress);
+                    int elapsed = saved.value("elapsed", 0);
+                    run_drill(session, deck_path, elapsed);
+                    continue;
+                }
+                DrillSession::clear_session(deck_id);
+            }
 
             if (!show_deck_summary(dname, deck.summary, deck_id, deck.cards, progress))
             {
