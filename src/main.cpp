@@ -599,6 +599,7 @@ static Deck parse_deck(const std::string& path)
         CardId
     };
     BlockField block_field = BlockField::None;
+    bool in_answer_fence = false;
 
     auto flush_card = [&]()
     {
@@ -608,6 +609,7 @@ static Deck parse_deck(const std::string& path)
         current_card = Card{};
         in_card = false;
         block_field = BlockField::None;
+        in_answer_fence = false;
     };
 
     auto append_line = [](std::string& target, const std::string& value)
@@ -683,6 +685,7 @@ static Deck parse_deck(const std::string& path)
         if (line == "A:" && in_card)
         {
             block_field = BlockField::Answer;
+            in_answer_fence = false;
             continue;
         }
 
@@ -706,6 +709,33 @@ static Deck parse_deck(const std::string& path)
 
         if (block_field == BlockField::Answer)
         {
+            std::string answer_trim = trim(line);
+            // Track fenced code: a ' :: ' inside ``` ... ``` is never a card boundary.
+            if (starts_with(answer_trim, "```"))
+            {
+                in_answer_fence = !in_answer_fence;
+                append_line(current_card.answer, line);
+                continue;
+            }
+            // Outside code, a top-level "Question :: Answer" line starts a NEW
+            // single-line card, so block cards and inline cards can interleave.
+            if (!in_answer_fence && line == answer_trim)
+            {
+                auto inline_segments = split_card_segments(line);
+                if (inline_segments.size() >= 2 &&
+                    !trim(inline_segments[0]).empty() &&
+                    !trim(inline_segments[1]).empty())
+                {
+                    flush_card();
+                    current_card = Card{};
+                    current_card.question = trim(inline_segments[0]);
+                    current_card.answer = trim(inline_segments[1]);
+                    apply_inline_card_metadata(current_card, inline_segments);
+                    in_card = true;
+                    block_field = BlockField::None;
+                    continue;
+                }
+            }
             append_line(current_card.answer, line);
             continue;
         }
@@ -1460,9 +1490,15 @@ struct StyledSpan
 
 using StyledLine = std::vector<StyledSpan>;
 
-struct DisplayBlock
+enum class ContentBlockType
 {
-    bool is_code = false;
+    Paragraph,
+    Code
+};
+
+struct ContentBlock
+{
+    ContentBlockType type = ContentBlockType::Paragraph;
     std::string language;
     std::string text;
 };
@@ -1472,9 +1508,9 @@ static bool is_language_char(char c)
     return std::isalnum((unsigned char)c) || c == '+' || c == '#' || c == '-' || c == '_';
 }
 
-static std::vector<DisplayBlock> parse_display_blocks(const std::string& text)
+static std::vector<ContentBlock> parse_card_content(const std::string& text)
 {
-    std::vector<DisplayBlock> blocks;
+    std::vector<ContentBlock> blocks;
     size_t pos = 0;
 
     while (pos < text.size())
@@ -1482,11 +1518,13 @@ static std::vector<DisplayBlock> parse_display_blocks(const std::string& text)
         size_t fence = text.find("```", pos);
         if (fence == std::string::npos)
         {
-            if (pos < text.size()) blocks.push_back({false, "", text.substr(pos)});
+            if (pos < text.size())
+                blocks.push_back({ContentBlockType::Paragraph, "", text.substr(pos)});
             break;
         }
 
-        if (fence > pos) blocks.push_back({false, "", text.substr(pos, fence - pos)});
+        if (fence > pos)
+            blocks.push_back({ContentBlockType::Paragraph, "", text.substr(pos, fence - pos)});
 
         size_t content_start = fence + 3;
         size_t close = text.find("```", content_start);
@@ -1508,7 +1546,7 @@ static std::vector<DisplayBlock> parse_display_blocks(const std::string& text)
                     content[code_start] == '\n' || content[code_start] == '\r'))
                 code_start++;
         }
-        blocks.push_back({true, language, content.substr(code_start)});
+        blocks.push_back({ContentBlockType::Code, language, content.substr(code_start)});
 
         if (close == std::string::npos) break;
         pos = close + 3;
@@ -1613,15 +1651,50 @@ static StyledLine highlight_code_line(const std::string& line, const std::string
     return out;
 }
 
+static std::vector<StyledLine> wrap_styled_line(const StyledLine& line, int width)
+{
+    std::vector<StyledLine> wrapped;
+    int safe_width = std::max(1, width);
+    StyledLine current;
+    int used = 0;
+
+    auto flush = [&]()
+    {
+        wrapped.push_back(current);
+        current.clear();
+        used = 0;
+    };
+
+    for (const auto& span : line)
+    {
+        size_t pos = 0;
+        while (pos < span.text.size())
+        {
+            if (used >= safe_width) flush();
+
+            int room = safe_width - used;
+            int take = std::min(room, (int)(span.text.size() - pos));
+            current.push_back({span.text.substr(pos, take), span.color, span.bold});
+            used += take;
+            pos += take;
+
+            if (used >= safe_width && pos < span.text.size()) flush();
+        }
+    }
+
+    if (!current.empty() || wrapped.empty()) wrapped.push_back(current);
+    return wrapped;
+}
+
 static std::vector<StyledLine> format_display_text(const std::string& text, int width, int text_color,
                                                    bool text_bold)
 {
     std::vector<StyledLine> lines;
     int safe_width = std::max(1, width);
 
-    for (const auto& block : parse_display_blocks(text))
+    for (const auto& block : parse_card_content(text))
     {
-        if (!block.is_code)
+        if (block.type == ContentBlockType::Paragraph)
         {
             std::istringstream stream(block.text);
             std::string paragraph_line;
@@ -1642,16 +1715,24 @@ static std::vector<StyledLine> format_display_text(const std::string& text, int 
 
         if (!lines.empty()) lines.push_back({{std::string(), CLR_DEFAULT, false}});
 
+        if (!block.language.empty())
+        {
+            std::string label = "[" + block.language + "]";
+            lines.push_back({{label, CLR_BORDER, false}});
+        }
+
         std::istringstream stream(block.text);
         std::string code_line;
         int code_width = std::max(1, safe_width - 2);
         while (std::getline(stream, code_line))
         {
-            if ((int)code_line.size() > code_width) code_line = code_line.substr(0, code_width);
-            StyledLine styled = {{"  ", CLR_BORDER, false}};
             auto spans = highlight_code_line(code_line, block.language);
-            styled.insert(styled.end(), spans.begin(), spans.end());
-            lines.push_back(styled);
+            for (const auto& wrapped_line : wrap_styled_line(spans, code_width))
+            {
+                StyledLine styled = {{"  ", CLR_BORDER, false}};
+                styled.insert(styled.end(), wrapped_line.begin(), wrapped_line.end());
+                lines.push_back(styled);
+            }
         }
 
         if (block.text.empty()) lines.push_back({{"  ", CLR_BORDER, false}});
@@ -2148,8 +2229,10 @@ static TypedAnswerJudgement judge_typed_answer(const std::string& model, const C
 {
     std::string system_prompt =
         "You grade flashcard answers. Compare the learner's typed answer to the expected answer. "
-        "Accept paraphrases, synonyms, minor typos, and incomplete wording only when the essential "
-        "meaning is present. Mark incorrect when a key fact is missing or contradicted. "
+        "Be lenient for study recall. Accept short answers, paraphrases, synonyms, minor typos, "
+        "and answers that give the core fact even if they omit minor supporting details. "
+        "Do not require word-for-word matching. Mark incorrect only when the core answer is "
+        "missing, contradicted, or too vague to show recall. "
         "Return only compact JSON with this exact shape: "
         "{\"correct\":true,\"feedback\":\"short plain text\"}. "
         "No markdown and no extra text.\n\n"
@@ -2231,12 +2314,18 @@ static TextInputResult get_input_result(int y, int x, int max_w)
 {
     std::string input;
     bool cancelled = false;
+    const int max_input_len = 2000;
     curs_set(1);
     timeout(-1);
     while (true)
     {
         mvhline(y, x, ' ', max_w);
-        mvprintw(y, x, "> %s", input.c_str());
+        int visible_w = std::max(1, max_w - 2);
+        std::string visible = input;
+        if ((int)visible.size() > visible_w)
+            visible = visible.substr(visible.size() - visible_w);
+        mvprintw(y, x, "> ");
+        addnstr(visible.c_str(), visible_w);
         refresh();
         int ch = getch();
         if (ch == '\n' || ch == KEY_ENTER) break;
@@ -2246,7 +2335,65 @@ static TextInputResult get_input_result(int y, int x, int max_w)
             break;
         }
         if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty()) { input.pop_back(); }
-        else if (ch >= 32 && ch < 127 && (int)input.size() < max_w - 4) { input += (char)ch; }
+        else if (ch >= 32 && ch < 127 && (int)input.size() < max_input_len)
+        {
+            input += (char)ch;
+        }
+    }
+    curs_set(0);
+    return {input, cancelled};
+}
+
+static std::vector<std::string> hard_wrap_line(const std::string& text, int width)
+{
+    std::vector<std::string> lines;
+    int safe_width = std::max(1, width);
+    if (text.empty()) return {""};
+    for (size_t i = 0; i < text.size(); i += safe_width)
+        lines.push_back(text.substr(i, safe_width));
+    return lines;
+}
+
+static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max_rows)
+{
+    std::string input;
+    bool cancelled = false;
+    const int max_input_len = 2000;
+    int visible_w = std::max(1, max_w - 2);
+    max_rows = std::max(1, max_rows);
+
+    curs_set(1);
+    timeout(-1);
+    while (true)
+    {
+        for (int i = 0; i < max_rows; i++)
+            mvhline(y + i, x, ' ', max_w);
+
+        std::vector<std::string> wrapped = hard_wrap_line(input, visible_w);
+        int start = std::max(0, (int)wrapped.size() - max_rows);
+        for (int i = 0; i < max_rows && start + i < (int)wrapped.size(); i++)
+        {
+            const std::string prefix = (start + i == 0) ? "> " : "  ";
+            mvprintw(y + i, x, "%s", prefix.c_str());
+            addnstr(wrapped[start + i].c_str(), visible_w);
+        }
+
+        refresh();
+        int ch = getch();
+        if (ch == '\n' || ch == KEY_ENTER) break;
+        if (ch == 27)
+        {
+            cancelled = true;
+            break;
+        }
+        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty())
+        {
+            input.pop_back();
+        }
+        else if (ch >= 32 && ch < 127 && (int)input.size() < max_input_len)
+        {
+            input += (char)ch;
+        }
     }
     curs_set(0);
     return {input, cancelled};
@@ -2923,79 +3070,98 @@ enum class TypedAnswerAction
     Wrong
 };
 
-static TypedAnswerAction prompt_and_judge_typed_answer(const Card& card, const std::string& deck)
+static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model, const Card& card,
+                                                       const std::string& deck, int input_y,
+                                                       int input_x, int input_w, int result_rows)
 {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    int content_w = std::min(max_x - 6, 72);
-    int left = (max_x - content_w) / 2;
+    input_w = std::max(20, std::min(input_w, max_x - input_x - 1));
+    result_rows = std::max(7, result_rows);
+    input_y = std::max(1, std::min(input_y, max_y - result_rows - 1));
 
-    draw_centered_message("Type Answer",
-                          {"Type your answer. Grimoire will ask AI to compare it with the saved answer."},
-                          "[Enter] judge  [Esc] cancel");
-    mvprintw(max_y - 4, left, "Answer");
-    TextInputResult typed = get_input_result(max_y - 3, left, content_w);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvhline(input_y, input_x, ' ', input_w);
+    mvprintw(input_y, input_x, "Type answer, then Enter");
+    attroff(COLOR_PAIR(CLR_DIM));
+    TextInputResult typed =
+        get_wrapped_input_result(input_y + 1, input_x, input_w, std::max(1, result_rows - 2));
     if (typed.cancelled || trim(typed.value).empty()) return TypedAnswerAction::Cancel;
 
-    std::string model = ensure_ollama_ready();
-    if (model.empty()) return TypedAnswerAction::Cancel;
-
-    clear();
+    getmaxyx(stdscr, max_y, max_x);
     attron(COLOR_PAIR(CLR_DIM));
-    mvprintw(max_y / 2, (max_x - 16) / 2, "Checking answer...");
+    for (int i = 0; i < result_rows && input_y + i < max_y - 1; i++)
+        mvhline(input_y + i, input_x, ' ', input_w);
+    mvprintw(input_y, input_x, "Checking answer...");
     attroff(COLOR_PAIR(CLR_DIM));
     refresh();
 
     TypedAnswerJudgement judgement = judge_typed_answer(model, card, deck, typed.value);
     bool suggested_correct = judgement.correct;
 
+    getmaxyx(stdscr, max_y, max_x);
+    int title_color = judgement.valid ? (suggested_correct ? CLR_CORRECT : CLR_WRONG) : CLR_WRONG;
+    std::string status = judgement.valid ? (suggested_correct ? "[y] Pass" : "[n] Fail")
+                                         : "[!] AI check failed";
+
+    std::vector<StyledLine> result_lines;
+    result_lines.push_back({{status, title_color, true}});
+    auto append_section = [&](const std::string& label, const std::string& text, int color)
+    {
+        result_lines.push_back({{label, color, false}});
+        auto lines = wrap_text(text, std::max(1, input_w - 2));
+        for (const auto& line : lines)
+            result_lines.push_back({{"  " + line, color, false}});
+    };
+
+    std::string feedback = judgement.feedback.empty() ? "No feedback returned." : judgement.feedback;
+    append_section("You:", typed.value, CLR_DEFAULT);
+    append_section("AI:", feedback, title_color);
+    append_section("Answer:", card.answer, CLR_DIM);
+
+    int scroll = 0;
+    timeout(-1);
     while (true)
     {
         getmaxyx(stdscr, max_y, max_x);
-        clear();
-        content_w = std::min(max_x - 6, 72);
-        left = (max_x - content_w) / 2;
-        int y = 1;
+        int visible_rows = std::max(1, std::min(result_rows, max_y - input_y - 2));
+        int max_scroll = std::max(0, (int)result_lines.size() - visible_rows);
+        scroll = std::max(0, std::min(scroll, max_scroll));
 
-        int title_color = judgement.valid ? (suggested_correct ? CLR_CORRECT : CLR_WRONG) : CLR_WRONG;
-        attron(COLOR_PAIR(title_color) | A_BOLD);
-        std::string title = judgement.valid ? (suggested_correct ? "AI: Correct" : "AI: Needs Review")
-                                            : "AI Check Failed";
-        mvprintw(y, (max_x - (int)title.size()) / 2, "%s", title.c_str());
-        attroff(COLOR_PAIR(title_color) | A_BOLD);
-        y += 2;
-        draw_hline_full(y, 0, max_x);
-        y += 2;
+        for (int i = 0; i < result_rows && input_y + i < max_y - 1; i++)
+            mvhline(input_y + i, input_x, ' ', input_w);
 
-        auto draw_section = [&](const std::string& label, const std::string& text, int color,
-                                bool bold)
+        int draw_y = input_y;
+        for (int i = 0; i < visible_rows && i + scroll < (int)result_lines.size(); i++)
         {
-            if (y >= max_y - 5) return;
-            attron(COLOR_PAIR(color) | A_BOLD);
-            mvprintw(y++, left, "%s", label.c_str());
-            attroff(COLOR_PAIR(color) | A_BOLD);
-            auto lines = format_display_text(text, content_w, color, bold);
-            draw_styled_lines(lines, y, left, max_y - 5, content_w);
-            y++;
-        };
+            StyledLine line = result_lines[i + scroll];
+            draw_styled_lines({line}, draw_y, input_x, input_y + visible_rows, input_w);
+        }
 
-        draw_section("Question", card.question, CLR_DIM, false);
-        draw_section("Your Answer", typed.value, CLR_DEFAULT, false);
-        draw_section("Expected Answer", card.answer, CLR_DEFAULT, true);
-        draw_section(judgement.valid ? "AI Feedback" : "Error", judgement.feedback, title_color, false);
-
-        draw_hline_full(max_y - 2, 0, max_x);
         attron(COLOR_PAIR(CLR_DIM));
-        mvprintw(max_y - 1, 1,
-                 judgement.valid ? "[Any key] apply AI mark" : "[Any key] back without marking");
+        mvhline(max_y - 2, 1, ' ', std::max(1, max_x - 2));
+        const char* hint =
+            max_scroll > 0 ? "[Enter] Next  [j/k] Scroll" :
+                             (judgement.valid ? "[Any key] Next" : "[Any key] Back without marking");
+        mvaddnstr(max_y - 2, 1, hint, std::max(1, max_x - 2));
         attroff(COLOR_PAIR(CLR_DIM));
-        refresh();
 
-        timeout(-1);
-        getch();
-        if (!judgement.valid) return TypedAnswerAction::Cancel;
-        return suggested_correct ? TypedAnswerAction::Correct : TypedAnswerAction::Wrong;
+        refresh();
+        int ch = getch();
+        if (max_scroll > 0 && (ch == 'j' || ch == KEY_DOWN))
+        {
+            if (scroll < max_scroll) scroll++;
+            continue;
+        }
+        if (max_scroll > 0 && (ch == 'k' || ch == KEY_UP))
+        {
+            if (scroll > 0) scroll--;
+            continue;
+        }
+        break;
     }
+    if (!judgement.valid) return TypedAnswerAction::Cancel;
+    return suggested_correct ? TypedAnswerAction::Correct : TypedAnswerAction::Wrong;
 }
 
 // Startup splash screen — random logo variant
@@ -3531,13 +3697,70 @@ static int choose_saved_deck_session(const std::string& deck_name, const json& s
     snprintf(state, sizeof(state), "Saved drill: round %d, %d cards left",
              saved.value("round_num", 1), remaining);
 
+    std::vector<std::pair<std::string, int>> options = {
+        {"Continue saved session", 'c'},
+        {"Start new session", 'n'},
+        {"Back to decks", 'q'},
+    };
+    int selected = 0;
+
     timeout(-1);
     while (true)
     {
-        draw_centered_message("Resume Deck?",
-                              {"A saved drill exists for " + deck_name + ".", state},
-                              "[c] continue last session  [n] new session  [q/Esc] back");
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        clear();
+
+        int box_w = std::min(std::max(44, (int)deck_name.size() + 12), max_x - 4);
+        int box_h = 11;
+        int box_x = (max_x - box_w) / 2;
+        int box_y = (max_y - box_h) / 2;
+        draw_box(box_y, box_x, box_h, box_w);
+
+        std::string title = "Resume Deck?";
+        attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+        mvprintw(box_y + 1, box_x + (box_w - (int)title.size()) / 2, "%s", title.c_str());
+        attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+        std::string deck_line = deck_name;
+        if ((int)deck_line.size() > box_w - 4) deck_line = deck_line.substr(0, box_w - 7) + "...";
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(box_y + 3, box_x + 2, "%s", deck_line.c_str());
+        mvprintw(box_y + 4, box_x + 2, "%s", state);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        for (int i = 0; i < (int)options.size(); i++)
+        {
+            int row = box_y + 6 + i;
+            if (i == selected)
+            {
+                attron(COLOR_PAIR(CLR_HIGHLIGHT));
+                mvprintw(row, box_x + 2, "%-*s", box_w - 4, options[i].first.c_str());
+                attroff(COLOR_PAIR(CLR_HIGHLIGHT));
+            }
+            else
+            {
+                mvprintw(row, box_x + 2, "%s", options[i].first.c_str());
+            }
+        }
+
+        attron(COLOR_PAIR(CLR_DIM));
+        mvprintw(max_y - 1, 1, "[j/k] Navigate  [Enter] Select  [Esc] Back");
+        attroff(COLOR_PAIR(CLR_DIM));
+        refresh();
+
         int ch = getch();
+        if (ch == 'j' || ch == KEY_DOWN)
+        {
+            if (selected < (int)options.size() - 1) selected++;
+            continue;
+        }
+        if (ch == 'k' || ch == KEY_UP)
+        {
+            if (selected > 0) selected--;
+            continue;
+        }
+        if (ch == '\n' || ch == KEY_ENTER || ch == ' ') return options[selected].second;
         if (ch == 'c' || ch == 'C') return 'c';
         if (ch == 'n' || ch == 'N') return 'n';
         if (ch == 'q' || ch == 27) return 'q';
@@ -3758,8 +3981,78 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
             }
             if (ch == 't')
             {
+                std::string model = ensure_ollama_ready();
+                if (model.empty())
+                {
+                    timeout(1000);
+                    continue;
+                }
+                int result_rows = 14;
+                int max_typed_card_h = std::max(16, max_y - 6);
+                int typed_card_h =
+                    std::min(std::max((int)q_lines.size() + result_rows + 7, 16),
+                             max_typed_card_h);
+                result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
+                int typed_box_y = std::max(6, (max_y - typed_card_h) / 2);
+                clear();
+                draw_drill_header(session, session_start, (int)session.round.size() + 1,
+                                  (int)session.missed.size());
+                draw_box(typed_box_y, box_x, typed_card_h, content_w);
+
+                int typed_inner_x = box_x + 2;
+                int typed_y = typed_box_y + 1;
+                attron(COLOR_PAIR(stage_color(stage)));
+                mvprintw(typed_y, typed_inner_x, "[%s]", stage_label(stage));
+                attroff(COLOR_PAIR(stage_color(stage)));
+                attron(COLOR_PAIR(CLR_DIM));
+                mvprintw(typed_y, box_x + content_w - 2 - (int)strlen(streak_str), "%s",
+                         streak_str);
+                attroff(COLOR_PAIR(CLR_DIM));
+                typed_y += 2;
+                int input_y = typed_box_y + typed_card_h - result_rows - 1;
+                draw_styled_lines(q_lines, typed_y, typed_inner_x, input_y - 1, content_w - 4);
+                attron(COLOR_PAIR(CLR_BORDER));
+                mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
+                attroff(COLOR_PAIR(CLR_BORDER));
+                attron(COLOR_PAIR(CLR_DIM));
+                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                attroff(COLOR_PAIR(CLR_DIM));
+                int total_cards_t = (int)session.cards.size();
+                if (total_cards_t > 0)
+                {
+                    int n = total_cards_t;
+                    int gaps = n - 1;
+                    int usable = max_x - gaps;
+                    int base_w = usable / n;
+                    int extra = usable % n;
+                    if (base_w < 1)
+                    {
+                        base_w = 1;
+                        extra = 0;
+                    }
+                    move(max_y - 1, 0);
+                    for (int i = 0; i < n; i++)
+                    {
+                        int start_extra = (n - extra) / 2;
+                        int w = base_w + (i >= start_extra && i < start_extra + extra ? 1 : 0);
+                        if (i < mastered)
+                            attron(COLOR_PAIR(CLR_CORRECT));
+                        else
+                            attron(COLOR_PAIR(CLR_DIM));
+                        for (int j = 0; j < w; j++)
+                            addch(ACS_HLINE);
+                        if (i < mastered)
+                            attroff(COLOR_PAIR(CLR_CORRECT));
+                        else
+                            attroff(COLOR_PAIR(CLR_DIM));
+                        if (i < n - 1) addch(' ');
+                    }
+                }
+                refresh();
+
                 TypedAnswerAction action =
-                    prompt_and_judge_typed_answer(card, session.deck_name);
+                    prompt_and_judge_typed_answer(model, card, session.deck_name, input_y,
+                                                  typed_inner_x, content_w - 4, result_rows);
                 timeout(1000);
                 if (action == TypedAnswerAction::Correct)
                 {
@@ -4071,8 +4364,42 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
             if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
             if (ch == 't')
             {
+                std::string model = ensure_ollama_ready();
+                if (model.empty())
+                {
+                    timeout(1000);
+                    continue;
+                }
+                int result_rows = 14;
+                int max_typed_card_h = std::max(16, max_y - 6);
+                int typed_card_h =
+                    std::min(std::max((int)q_lines.size() + result_rows + 7, 16),
+                             max_typed_card_h);
+                result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
+                int typed_box_y = std::max(5, (max_y - typed_card_h) / 2);
+                clear();
+                draw_review_header(item, idx, total, reviewed, again_count, session_start);
+                draw_box(typed_box_y, box_x, typed_card_h, content_w);
+
+                int typed_inner_x = box_x + 2;
+                int typed_y = typed_box_y + 1;
+                attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+                mvprintw(typed_y, typed_inner_x, "%s", item.is_new ? "[new]" : "[review]");
+                attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+                typed_y += 2;
+                int input_y = typed_box_y + typed_card_h - result_rows - 1;
+                draw_styled_lines(q_lines, typed_y, typed_inner_x, input_y - 1, content_w - 4);
+                attron(COLOR_PAIR(CLR_BORDER));
+                mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
+                attroff(COLOR_PAIR(CLR_BORDER));
+                attron(COLOR_PAIR(CLR_DIM));
+                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                attroff(COLOR_PAIR(CLR_DIM));
+                refresh();
+
                 TypedAnswerAction action =
-                    prompt_and_judge_typed_answer(item.card, item.deck_id);
+                    prompt_and_judge_typed_answer(model, item.card, item.deck_id, input_y,
+                                                  typed_inner_x, content_w - 4, result_rows);
                 timeout(1000);
                 if (action == TypedAnswerAction::Correct)
                 {

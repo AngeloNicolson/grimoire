@@ -41,7 +41,9 @@ Press `a` during a drill to ask an AI about the current card. Grimoire integrate
 
 ## Card Format
 
-Grimoire supports both single-line cards and block cards.
+Grimoire supports both single-line cards and block cards. You can mix both
+formats in the same deck file, so compact cards can stay on one line while only
+cards that need multiline answers or code use block form.
 
 ### Single-line cards
 
@@ -62,16 +64,44 @@ What is DNS? :: Domain Name System. :: id=dns-definition :: note=Study-Vault/Pro
 
 Use block cards for multiline content, code samples, stable ids, and note references:
 
-```text
+````text
 Q:
 What is DNS?
 A:
 Domain Name System - translates domain names into IP addresses.
+
+```cpp
+std::cout << "DNS maps names to addresses\n";
+```
+
 ID:
 dns-definition
 NOTE:
 Study-Vault/Programming/Computer Science/Computer Networks/DNS.md#DNS
+````
+
+### Card markup
+
+Question and answer text is parsed into display blocks before rendering:
+
+- Plain paragraphs wrap to the card width.
+- Fenced code blocks use triple backticks and preserve line breaks.
+- Add an optional language after the opening fence, such as `cpp`, `python`, `bash`, `sh`, or `json`, for basic syntax highlighting.
+- Long code lines wrap inside the card instead of being cut off.
+
+Example:
+
+````text
+Q:
+What does this Python loop do?
+A:
+It prints each name.
+
+```python
+for name in names:
+    print(name)
 ```
+````
 
 ### Deck metadata
 
@@ -90,6 +120,10 @@ What is DNS? :: Domain Name System.
 If `deck_id` is present, Grimoire uses it instead of the file path for progress tracking. This lets you move deck files without losing progress. If a card has an `id`, Grimoire also tracks mastery by that stable card id instead of line order.
 
 Empty lines and lines without `::` are ignored outside block cards.
+
+Inside a block answer, a top-level `Question :: Answer` line starts the next
+single-line card unless it appears inside a fenced code block. If you need a
+literal `::` example in an answer, put it in a fenced code block or indent it.
 
 ## Directory Structure
 
@@ -143,8 +177,9 @@ The deck browser shows subjects on the left and decks on the right.
 | `Enter` | Select |
 | `q` | Quit |
 
-If a selected deck has a saved drill, Grimoire asks whether to continue the last
-session or start a new one.
+If a selected deck has a saved drill, Grimoire opens a resume selector. Use
+`j`/`k` to choose whether to continue the saved session, start a new session, or
+go back, then press `Enter`.
 
 ### Drill
 | Key | Action |
