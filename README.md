@@ -177,6 +177,10 @@ The deck browser shows subjects on the left and decks on the right.
 | `Enter` | Select |
 | `q` | Quit |
 
+Highlighting a deck shows a stats preview in the right column: card count, overall
+correct rate (green ≥70%, red below), the date it was last drilled to completion,
+and a peek at the first few questions.
+
 If a selected deck has a saved drill, Grimoire opens a resume selector. Use
 `j`/`k` to choose whether to continue the saved session, start a new session, or
 go back, then press `Enter`.
@@ -201,22 +205,30 @@ go back, then press `Enter`.
 | `j`/`k` | Scroll response |
 | `q`/`Esc` | Back to card |
 
-### Review (Spaced Repetition)
-From the splash screen, `[r] Review due (N)` starts a cross-deck review of every card due today (plus up to 20 new cards), oldest-due first.
+### Drill Review (Weakness Pool)
+From the splash screen, `[r] Drill Review (N)` starts a cross-deck pass over the cards you most
+often get wrong. It draws only from **decks you've completed at least one drill of**, ranks them
+by a difficulty weight, and shows the weakest first.
 
 | Key | Action |
 |-----|--------|
 | `t` | Type an answer and let AI mark it automatically |
 | `Space` | Show answer |
-| `1` | Again — reset, see again tomorrow |
-| `2` | Good — schedule at the next interval |
-| `3` | Easy — schedule at a longer interval |
+| `Space`/`y` | Got it (on the answer screen) |
+| `n` | Missed (on the answer screen) |
 | `a` | Ask AI about this card |
 | `q` | Quit review (graded cards are saved) |
 
-Each grade shows its resulting interval (e.g. `[2] Good 6d`). Scheduling uses an SM-2-lite algorithm: intervals grow as `1d → 6d → interval × ease`, with ease rising on Easy and falling on Again. Review sessions count toward your daily streak.
+Every answer updates a per-card `right`/`wrong`/`last_seen` tally (in both drill and drill review).
+The pool weight is the card's smoothed **error rate** scaled by **recency**: a card answered today
+is damped (cooldown), and a card you keep missing but haven't seen in a while floats to the top. As
+your right count climbs, a card's weight decays and it drops out of the pool on its own. Up to 20
+cards are shown per session.
 
-Run `grimoire --due` to print the number of cards due (handy for status bars).
+Run `grimoire --due` to print the size of the current drill-review pool (handy for status bars).
+
+> A separate date-based spaced-repetition mode is planned; the SM-2 scheduling code remains in
+> place but is currently unused while Drill Review is the active review mode.
 
 ## Installation
 
@@ -259,7 +271,8 @@ Progress is saved to `~/.local/share/grimoire/progress.json`. This includes:
 
 - **drill_mastery**: Per-card mastery stages (persists across sessions)
 - **deck_stats**: Session completion/abandonment counts per deck
-- **schedule**: Per-card spaced-repetition state (`due`, `interval`, `ease`, `reps`, `last`)
+- **card_stats**: Per-card `right`/`wrong`/`last_seen` tally that drives the Drill Review pool
+- **schedule**: Per-card SM-2 spaced-repetition state (`due`, `interval`, `ease`, `reps`, `last`) — retained but currently unused
 
 ## Configuration
 
@@ -298,9 +311,9 @@ Ollama defaults to `http://localhost:11434`.
 
 ### v0.4 - Polish
 - [ ] Config file (~/.config/grimoire/config.toml) for deck dir, data path, colors
-- [ ] Session summary screen (cards drilled, time, stage changes)
-- [ ] Progress bar showing session completion
-- [ ] Deck-level stats view (stage distribution, last drilled)
+- [x] Session summary screen (cards, rounds, answers, accuracy, time)
+- [x] Progress bar showing session completion
+- [x] Deck-level stats view (stage distribution, sessions)
 
 ### v0.5 - Advanced Drilling
 - [ ] Tag-based filtering (drill only cards with specific tags)
@@ -316,7 +329,8 @@ Ollama defaults to `http://localhost:11434`.
 
 ### Future
 - [ ] Multiple card formats (markdown tables, CSV)
-- [x] Spaced repetition scheduling (cross-deck "Review due" with SM-2-lite)
+- [x] Drill Review (cross-deck weakness pool weighted by per-card error rate + recency)
+- [ ] Date-based spaced repetition mode (SM-2; scheduling code already present, currently unused)
 - [ ] Sync progress across machines
 - [ ] Export stats
 

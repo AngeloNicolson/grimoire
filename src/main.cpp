@@ -831,7 +831,8 @@ struct Progress
     json drill_mastery;
     json deck_stats;
     json session_history;
-    json schedule; // spaced-repetition schedule keyed by "<deck_id>:<card_key>"
+    json schedule;    // spaced-repetition schedule keyed by "<deck_id>:<card_key>" (dormant)
+    json card_stats;  // per-card right/wrong/last_seen tally, keyed like sched_key
 
     void load()
     {
@@ -843,6 +844,7 @@ struct Progress
             deck_stats = json::object();
             session_history = json::array();
             schedule = json::object();
+            card_stats = json::object();
             return;
         }
         try
@@ -852,6 +854,7 @@ struct Progress
             deck_stats = data.value("deck_stats", json::object());
             session_history = data.value("session_history", json::array());
             schedule = data.value("schedule", json::object());
+            card_stats = data.value("card_stats", json::object());
         }
         catch (...)
         {
@@ -859,6 +862,7 @@ struct Progress
             deck_stats = json::object();
             session_history = json::array();
             schedule = json::object();
+            card_stats = json::object();
         }
     }
 
@@ -873,6 +877,7 @@ struct Progress
         data["deck_stats"] = deck_stats;
         data["session_history"] = session_history;
         data["schedule"] = schedule;
+        data["card_stats"] = card_stats;
         file << data.dump(2);
         write_library_metadata(*this);
     }
@@ -895,6 +900,70 @@ struct Progress
     {
         if (!schedule.is_object()) schedule = json::object();
         schedule[key] = entry;
+    }
+
+    json get_card_stat(const std::string& key) const
+    {
+        if (card_stats.is_object() && card_stats.contains(key)) return card_stats[key];
+        return json();
+    }
+
+    // Record one answer to a card. Drives the drill-review weakness pool.
+    void record_answer(const std::string& deck_id, const std::string& card_key, int fallback_idx,
+                       bool correct)
+    {
+        if (!card_stats.is_object()) card_stats = json::object();
+        std::string key = sched_key(deck_id, card_key, fallback_idx);
+        json& entry = card_stats[key];
+        if (!entry.is_object()) entry = json::object();
+        if (correct)
+            entry["right"] = entry.value("right", 0) + 1;
+        else
+            entry["wrong"] = entry.value("wrong", 0) + 1;
+        entry["last_seen"] = iso_date();
+    }
+
+    // A deck is eligible for drill review once at least one drill session has been completed.
+    bool deck_completed(const std::string& deck_id) const
+    {
+        if (!deck_stats.is_object() || !deck_stats.contains(deck_id)) return false;
+        return deck_stats[deck_id].value("completed", 0) > 0;
+    }
+
+    // ISO date of the most recent completed drill of this deck, or "" if never completed.
+    std::string last_completed_date(const std::string& deck_id) const
+    {
+        std::string best;
+        long long best_ts = -1;
+        if (!session_history.is_array()) return best;
+        for (const auto& e : session_history)
+        {
+            if (!e.is_object()) continue;
+            if (e.value("deck_id", "") != deck_id) continue;
+            if (e.value("result", "") != "completed") continue;
+            long long ts = e.value("timestamp", 0LL);
+            if (ts > best_ts)
+            {
+                best_ts = ts;
+                best = e.value("date", "");
+            }
+        }
+        return best;
+    }
+
+    // Aggregate correct rate (0-100) across a deck's cards, or -1 if never answered.
+    int deck_correct_rate(const std::string& deck_id, const std::vector<Card>& cards) const
+    {
+        int right = 0, wrong = 0;
+        for (size_t i = 0; i < cards.size(); i++)
+        {
+            json st = get_card_stat(sched_key(deck_id, cards[i].id, (int)i));
+            if (!st.is_object()) continue;
+            right += st.value("right", 0);
+            wrong += st.value("wrong", 0);
+        }
+        if (right + wrong == 0) return -1;
+        return (right * 100) / (right + wrong);
     }
 
     int get_stage(const std::string& deck_id, int card_idx) const
@@ -1183,6 +1252,8 @@ struct DrillSession
     std::vector<int> streaks;
     std::vector<int> targets;
     int round_num = 1;
+    int session_right = 0; // answers graded correct this sitting
+    int session_wrong = 0; // answers graded wrong this sitting
 
     void init(const std::string& id, std::vector<Card> c, Progress* p)
     {
@@ -1234,6 +1305,8 @@ struct DrillSession
 
     void mark_correct(int idx)
     {
+        progress->record_answer(deck_id, cards[idx].id, idx, true);
+        session_right++;
         streaks[idx]++;
         if (streaks[idx] >= targets[idx])
         {
@@ -1250,6 +1323,8 @@ struct DrillSession
 
     void mark_wrong(int idx)
     {
+        progress->record_answer(deck_id, cards[idx].id, idx, false);
+        session_wrong++;
         streaks[idx] = 0;
         int stage = progress->get_stage(deck_id, cards[idx].id, idx);
         int new_stage = std::max(stage - 1, 0);
@@ -3072,7 +3147,8 @@ enum class TypedAnswerAction
 
 static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model, const Card& card,
                                                        const std::string& deck, int input_y,
-                                                       int input_x, int input_w, int result_rows)
+                                                       int input_x, int input_w, int result_rows,
+                                                       int box_y)
 {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
@@ -3106,12 +3182,19 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
 
     std::vector<StyledLine> result_lines;
     result_lines.push_back({{status, title_color, true}});
+    // Render each section through format_display_text so fenced code in the answer is parsed
+    // and syntax-highlighted instead of dumped as raw backticks. Body lines are indented 2.
     auto append_section = [&](const std::string& label, const std::string& text, int color)
     {
         result_lines.push_back({{label, color, false}});
-        auto lines = wrap_text(text, std::max(1, input_w - 2));
-        for (const auto& line : lines)
-            result_lines.push_back({{"  " + line, color, false}});
+        auto styled = format_display_text(text, std::max(1, input_w - 4), color, false);
+        for (auto& sl : styled)
+        {
+            StyledLine indented;
+            indented.push_back({"  ", color, false});
+            for (auto& sp : sl) indented.push_back(sp);
+            result_lines.push_back(indented);
+        }
     };
 
     std::string feedback = judgement.feedback.empty() ? "No feedback returned." : judgement.feedback;
@@ -3119,16 +3202,32 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
     append_section("AI:", feedback, title_color);
     append_section("Answer:", card.answer, CLR_DIM);
 
+    // Size the result card to its content: extend the box down to fit, and only scroll once the
+    // content would run past the bottom of the screen.
+    getmaxyx(stdscr, max_y, max_x);
+    int box_x_full = input_x - 2;
+    int box_w_full = input_w + 4;
+    int avail_rows = std::max(1, (max_y - 3) - input_y);
+    int visible_rows = std::min((int)result_lines.size(), avail_rows);
+    int box_bottom = input_y + visible_rows; // row of the box's bottom border
+
+    // Wipe from the separator down, then redraw the (possibly taller/shorter) box once. The
+    // question and header above input_y - 1 are left intact.
+    for (int yy = input_y - 1; yy < max_y; yy++)
+        mvhline(yy, 0, ' ', max_x);
+    draw_box(box_y, box_x_full, box_bottom - box_y + 1, box_w_full);
+    attron(COLOR_PAIR(CLR_BORDER));
+    mvhline(input_y - 1, box_x_full + 1, ACS_HLINE, box_w_full - 2);
+    attroff(COLOR_PAIR(CLR_BORDER));
+
     int scroll = 0;
+    int max_scroll = std::max(0, (int)result_lines.size() - visible_rows);
     timeout(-1);
     while (true)
     {
-        getmaxyx(stdscr, max_y, max_x);
-        int visible_rows = std::max(1, std::min(result_rows, max_y - input_y - 2));
-        int max_scroll = std::max(0, (int)result_lines.size() - visible_rows);
         scroll = std::max(0, std::min(scroll, max_scroll));
 
-        for (int i = 0; i < result_rows && input_y + i < max_y - 1; i++)
+        for (int i = 0; i < visible_rows; i++)
             mvhline(input_y + i, input_x, ' ', input_w);
 
         int draw_y = input_y;
@@ -3140,10 +3239,18 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
 
         attron(COLOR_PAIR(CLR_DIM));
         mvhline(max_y - 2, 1, ' ', std::max(1, max_x - 2));
-        const char* hint =
-            max_scroll > 0 ? "[Enter] Next  [j/k] Scroll" :
-                             (judgement.valid ? "[Any key] Next" : "[Any key] Back without marking");
-        mvaddnstr(max_y - 2, 1, hint, std::max(1, max_x - 2));
+        std::string hint;
+        if (max_scroll > 0)
+        {
+            int shown = std::min((int)result_lines.size(), scroll + visible_rows);
+            char sc[72];
+            snprintf(sc, sizeof(sc), "[Enter] Next  [j/k] Scroll  (%d/%d)", shown,
+                     (int)result_lines.size());
+            hint = sc;
+        }
+        else
+            hint = judgement.valid ? "[Any key] Next" : "[Any key] Back without marking";
+        mvaddnstr(max_y - 2, 1, hint.c_str(), std::max(1, max_x - 2));
         attroff(COLOR_PAIR(CLR_DIM));
 
         refresh();
@@ -3254,7 +3361,7 @@ static int show_splash(int due_count)
     if (due_count > 0)
     {
         char rev[64];
-        snprintf(rev, sizeof(rev), "[r] Review due (%d)", due_count);
+        snprintf(rev, sizeof(rev), "[r] Drill Review (%d)", due_count);
         attron(COLOR_PAIR(CLR_HEADER) | A_BOLD);
         mvprintw(hint_y, (max_x - (int)strlen(rev)) / 2, "%s", rev);
         attroff(COLOR_PAIR(CLR_HEADER) | A_BOLD);
@@ -3283,7 +3390,7 @@ static int show_splash(int due_count)
 // Columns: parent | current | child/preview
 // Navigate with h/l to go up/down directory levels, j/k to move within a listing.
 
-static std::string browse_decks(const std::string& root)
+static std::string browse_decks(const std::string& root, const Progress& progress)
 {
     // Navigation state: current directory path + selection index per directory
     std::string cwd = root;
@@ -3471,12 +3578,33 @@ static std::string browse_decks(const std::string& root)
         {
             auto preview_deck = parse_deck(path);
             int n = (int)preview_deck.cards.size();
+            std::string did =
+                preview_deck.id.empty() ? deck_id_from_path(path, root) : preview_deck.id;
+            int rate = progress.deck_correct_rate(did, preview_deck.cards);
+            std::string last = progress.last_completed_date(did);
+
+            int y = list_start;
             attron(COLOR_PAIR(CLR_DIM));
-            mvprintw(list_start, px + 1, "%d card%s", n, n == 1 ? "" : "s");
-            int preview_y = list_start + 2;
-            for (int i = 0; i < std::min(n, list_h - 2); i++)
+            mvprintw(y++, px + 1, "%d card%s", n, n == 1 ? "" : "s");
+
+            char rate_s[48];
+            if (rate >= 0)
+                snprintf(rate_s, sizeof(rate_s), "Correct: %d%%", rate);
+            else
+                snprintf(rate_s, sizeof(rate_s), "Correct: --");
+            attroff(COLOR_PAIR(CLR_DIM));
+            attron(COLOR_PAIR(rate < 0 ? CLR_DIM : (rate >= 70 ? CLR_CORRECT : CLR_WRONG)));
+            mvprintw(y++, px + 1, "%s", rate_s);
+            attroff(COLOR_PAIR(rate < 0 ? CLR_DIM : (rate >= 70 ? CLR_CORRECT : CLR_WRONG)));
+
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(y++, px + 1, "Last done: %s", last.empty() ? "never" : last.c_str());
+
+            int preview_y = y + 1;
+            for (int i = 0; i < std::min(n, list_h - (preview_y - list_start)); i++)
             {
                 std::string q = preview_deck.cards[i].question;
+                std::replace(q.begin(), q.end(), '\n', ' ');
                 if ((int)q.size() > pw - 2) q = q.substr(0, pw - 5) + "...";
                 mvprintw(preview_y + i, px + 1, "%s", q.c_str());
             }
@@ -3834,14 +3962,15 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
         {
             if (!session.next_round())
             {
-                // All mastered - completion screen
+                // All mastered - session summary screen
+                int elapsed = (int)difftime(time(nullptr), session_start);
                 int max_y, max_x;
                 getmaxyx(stdscr, max_y, max_x);
                 clear();
 
                 // Centered box
-                int box_w = 40;
-                int box_h = 9;
+                int box_w = 46;
+                int box_h = 13;
                 int box_x = (max_x - box_w) / 2;
                 int box_y = (max_y - box_h) / 2;
                 draw_box(box_y, box_x, box_h, box_w);
@@ -3851,21 +3980,29 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 mvprintw(box_y + 2, box_x + (box_w - (int)msg.size()) / 2, "%s", msg.c_str());
                 attroff(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
 
-                char buf[64];
-                snprintf(buf, sizeof(buf), "All %d cards mastered", (int)session.cards.size());
+                int total_answers = session.session_right + session.session_wrong;
+                int accuracy = total_answers > 0 ? (session.session_right * 100) / total_answers : 0;
+                char l_cards[48], l_rounds[48], l_answers[48], l_time[48];
+                snprintf(l_cards, sizeof(l_cards), "Cards mastered : %d", (int)session.cards.size());
+                snprintf(l_rounds, sizeof(l_rounds), "Rounds         : %d", session.round_num);
+                snprintf(l_answers, sizeof(l_answers), "Answers        : %d right  %d wrong (%d%%)",
+                         session.session_right, session.session_wrong, accuracy);
+                snprintf(l_time, sizeof(l_time), "Time           : %s",
+                         format_elapsed(session_start).c_str());
+                int lx = box_x + 3;
                 attron(COLOR_PAIR(CLR_DIM));
-                mvprintw(box_y + 4, box_x + (box_w - (int)strlen(buf)) / 2, "%s", buf);
-                attroff(COLOR_PAIR(CLR_DIM));
+                mvprintw(box_y + 4, lx, "%s", l_cards);
+                mvprintw(box_y + 5, lx, "%s", l_rounds);
+                mvprintw(box_y + 6, lx, "%s", l_answers);
+                mvprintw(box_y + 7, lx, "%s", l_time);
 
                 std::string hint = "[Press any key]";
-                attron(COLOR_PAIR(CLR_DIM));
-                mvprintw(box_y + 6, box_x + (box_w - (int)hint.size()) / 2, "%s", hint.c_str());
+                mvprintw(box_y + 9, box_x + (box_w - (int)hint.size()) / 2, "%s", hint.c_str());
                 attroff(COLOR_PAIR(CLR_DIM));
 
                 refresh();
                 timeout(-1); // block for final screen
                 getch();
-                int elapsed = (int)difftime(time(nullptr), session_start);
                 session.progress->record_session(g_vault_root, session.deck_id, deck_path,
                                                 (int)session.cards.size(), elapsed, true);
                 session.progress->save();
@@ -4052,7 +4189,8 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
 
                 TypedAnswerAction action =
                     prompt_and_judge_typed_answer(model, card, session.deck_name, input_y,
-                                                  typed_inner_x, content_w - 4, result_rows);
+                                                  typed_inner_x, content_w - 4, result_rows,
+                                                  typed_box_y);
                 timeout(1000);
                 if (action == TypedAnswerAction::Correct)
                 {
@@ -4274,6 +4412,71 @@ static std::vector<ReviewItem> build_review_queue(const Progress& progress, int 
     return queue;
 }
 
+// Difficulty weight for the drill-review pool. Error rate (Laplace-smoothed so a fresh card
+// is ~0.5, never a divide-by-zero) scaled by recency: a card answered today is damped
+// (cooldown), and one you keep missing but haven't seen in a while floats to the top. As a
+// card's right count climbs its error rate falls, so it decays out of the pool on its own.
+static double drill_review_weight(const json& stat, int today)
+{
+    int right = stat.value("right", 0);
+    int wrong = stat.value("wrong", 0);
+    double error_rate = (wrong + 1.0) / (right + wrong + 2.0);
+    const double target_gap = 3.0; // days until a card is fully "cooled down"
+    double recency = 1.0;
+    if (stat.contains("last_seen"))
+    {
+        int last = iso_date_to_day_number(stat.value("last_seen", ""));
+        int gap = today - last;
+        if (gap < 0) gap = 0;
+        recency = std::min(1.0, (gap + 1.0) / (target_gap + 1.0));
+    }
+    return error_rate * recency;
+}
+
+// Build the drill-review pool: cards from decks completed at least once, ranked by difficulty
+// weight (weakest first). Returns the top `limit` cards.
+static std::vector<ReviewItem> build_drill_review_pool(const Progress& progress, int limit = 20)
+{
+    std::vector<std::pair<double, ReviewItem>> scored;
+    // Match the deck_id keying used when drilling writes card_stats (non-normalized root).
+    std::string deck_root = expand_home(g_deck_dir);
+    int today = iso_date_to_day_number(iso_date());
+
+    for (const auto& deck_path : list_deck_files_recursive(deck_root))
+    {
+        Deck deck = parse_deck(deck_path);
+        if (deck.cards.empty()) continue;
+        std::string deck_id = deck.id.empty() ? deck_id_from_path(deck_path, deck_root) : deck.id;
+        if (!progress.deck_completed(deck_id)) continue;
+        for (size_t i = 0; i < deck.cards.size(); i++)
+        {
+            ReviewItem item;
+            item.deck_id = deck_id;
+            item.deck_path = deck_path;
+            item.card_key = deck.cards[i].id;
+            item.card_idx = (int)i;
+            item.card = deck.cards[i];
+
+            std::string key = progress.sched_key(deck_id, deck.cards[i].id, (int)i);
+            json stat = progress.get_card_stat(key);
+            if (!stat.is_object()) stat = json::object();
+            item.is_new = !stat.contains("right") && !stat.contains("wrong");
+            scored.push_back({drill_review_weight(stat, today), item});
+        }
+    }
+
+    std::sort(scored.begin(), scored.end(),
+              [](const std::pair<double, ReviewItem>& a, const std::pair<double, ReviewItem>& b)
+              { return a.first > b.first; });
+    std::vector<ReviewItem> pool;
+    for (auto& s : scored)
+    {
+        if ((int)pool.size() >= limit) break;
+        pool.push_back(s.second);
+    }
+    return pool;
+}
+
 static void draw_review_header(const ReviewItem& item, int idx, int total, int reviewed,
                                int again_count, time_t session_start)
 {
@@ -4399,7 +4602,8 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
 
                 TypedAnswerAction action =
                     prompt_and_judge_typed_answer(model, item.card, item.deck_id, input_y,
-                                                  typed_inner_x, content_w - 4, result_rows);
+                                                  typed_inner_x, content_w - 4, result_rows,
+                                                  typed_box_y);
                 timeout(1000);
                 if (action == TypedAnswerAction::Correct)
                 {
@@ -4551,6 +4755,238 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
     getch();
 }
 
+static void draw_drill_review_header(const ReviewItem& item, int idx, int total, int reviewed,
+                                    int wrong_count, time_t session_start)
+{
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+
+    attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+    mvprintw(1, 2, "DRILL REVIEW");
+    attroff(COLOR_PAIR(CLR_TITLE) | A_BOLD);
+
+    std::string dname = item.deck_id;
+    auto slash = dname.rfind('/');
+    if (slash != std::string::npos) dname = dname.substr(slash + 1);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, 17, "%s", dname.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    char stat[96];
+    snprintf(stat, sizeof(stat), "card %d/%d  missed %d  %s", idx + 1, total, wrong_count,
+             format_elapsed(session_start).c_str());
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(1, max_x - (int)strlen(stat) - 2, "%s", stat);
+    attroff(COLOR_PAIR(CLR_DIM));
+
+    int filled = total > 0 ? (reviewed * max_x) / total : 0;
+    move(2, 0);
+    for (int i = 0; i < max_x; i++)
+    {
+        bool on = i < filled;
+        attron(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+        addch(ACS_HLINE);
+        attroff(COLOR_PAIR(on ? CLR_CORRECT : CLR_DIM));
+    }
+}
+
+// Drill Review: a weakness-pool pass over the cards you most often miss across completed decks.
+// Each card is graded right/wrong, which feeds the per-card tally that ranks the pool.
+static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
+{
+    if (items.empty()) return;
+    time_t session_start = time(nullptr);
+    int total = (int)items.size();
+    int reviewed = 0;
+    int wrong_count = 0;
+    timeout(1000); // refresh elapsed timer
+
+    auto grade_card = [&](ReviewItem& item, bool correct)
+    {
+        progress.record_answer(item.deck_id, item.card_key, item.card_idx, correct);
+        int st = progress.get_stage(item.deck_id, item.card_key, item.card_idx);
+        progress.set_stage(item.deck_id, item.card_key, item.card_idx,
+                           correct ? std::min(st + 1, 2) : std::max(st - 1, 0));
+        progress.save();
+        if (!correct) wrong_count++;
+        reviewed++;
+    };
+
+    for (int idx = 0; idx < total; idx++)
+    {
+        ReviewItem& item = items[idx];
+        bool quit = false;
+        int typed_grade = -1; // 1 correct, 0 wrong
+
+        // --- Question phase ---
+        bool reveal = false;
+        while (!reveal && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DEFAULT, false);
+            int card_h = std::min((int)q_lines.size() + 6, std::max(6, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[weak]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[t] Type Answer  [Space] Show Answer  [a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            if (ch == 't')
+            {
+                std::string model = ensure_ollama_ready();
+                if (model.empty())
+                {
+                    timeout(1000);
+                    continue;
+                }
+                int result_rows = 14;
+                int max_typed_card_h = std::max(16, max_y - 6);
+                int typed_card_h =
+                    std::min(std::max((int)q_lines.size() + result_rows + 7, 16), max_typed_card_h);
+                result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
+                int typed_box_y = std::max(5, (max_y - typed_card_h) / 2);
+                clear();
+                draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
+                draw_box(typed_box_y, box_x, typed_card_h, content_w);
+
+                int typed_inner_x = box_x + 2;
+                int typed_y = typed_box_y + 1;
+                attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+                mvprintw(typed_y, typed_inner_x, "%s", item.is_new ? "[new]" : "[weak]");
+                attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+                typed_y += 2;
+                int input_y = typed_box_y + typed_card_h - result_rows - 1;
+                draw_styled_lines(q_lines, typed_y, typed_inner_x, input_y - 1, content_w - 4);
+                attron(COLOR_PAIR(CLR_BORDER));
+                mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
+                attroff(COLOR_PAIR(CLR_BORDER));
+                attron(COLOR_PAIR(CLR_DIM));
+                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                attroff(COLOR_PAIR(CLR_DIM));
+                refresh();
+
+                TypedAnswerAction action =
+                    prompt_and_judge_typed_answer(model, item.card, item.deck_id, input_y,
+                                                  typed_inner_x, content_w - 4, result_rows,
+                                                  typed_box_y);
+                timeout(1000);
+                if (action == TypedAnswerAction::Correct) { typed_grade = 1; reveal = true; break; }
+                if (action == TypedAnswerAction::Wrong) { typed_grade = 0; reveal = true; break; }
+                continue;
+            }
+            if (ch == ' ') reveal = true;
+        }
+        if (quit) break;
+
+        if (typed_grade >= 0)
+        {
+            grade_card(item, typed_grade == 1);
+            continue;
+        }
+
+        // --- Answer + grade phase ---
+        bool graded = false;
+        while (!graded && !quit)
+        {
+            int max_y, max_x;
+            getmaxyx(stdscr, max_y, max_x);
+            clear();
+            draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
+
+            int content_w = std::min(max_x - 6, 60);
+            auto q_lines = format_display_text(item.card.question, content_w - 4, CLR_DIM, false);
+            auto a_lines = format_display_text(item.card.answer, content_w - 4, CLR_DEFAULT, true);
+            int card_h =
+                std::min((int)q_lines.size() + (int)a_lines.size() + 8, std::max(8, max_y - 9));
+            int box_x = (max_x - content_w) / 2;
+            int box_y = std::max(5, (max_y - card_h) / 2);
+            draw_box(box_y, box_x, card_h, content_w);
+
+            int inner_x = box_x + 2;
+            int y = box_y + 1;
+            attron(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            mvprintw(y, inner_x, "%s", item.is_new ? "[new]" : "[weak]");
+            attroff(COLOR_PAIR(item.is_new ? CLR_HEADER : CLR_DIM));
+            y += 2;
+            draw_styled_lines(q_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+            y++;
+            attron(COLOR_PAIR(CLR_BORDER));
+            mvhline(y, box_x + 1, ACS_HLINE, content_w - 2);
+            attroff(COLOR_PAIR(CLR_BORDER));
+            y += 2;
+            draw_styled_lines(a_lines, y, inner_x, box_y + card_h - 1, content_w - 4);
+
+            attron(COLOR_PAIR(CLR_CORRECT));
+            mvprintw(max_y - 3, 1, "[Space/y] Got it");
+            attroff(COLOR_PAIR(CLR_CORRECT));
+            attron(COLOR_PAIR(CLR_WRONG));
+            mvprintw(max_y - 3, 20, "[n] Missed");
+            attroff(COLOR_PAIR(CLR_WRONG));
+            attron(COLOR_PAIR(CLR_DIM));
+            mvprintw(max_y - 2, 1, "[a] Ask AI  [q] Quit");
+            attroff(COLOR_PAIR(CLR_DIM));
+            refresh();
+
+            int ch = getch();
+            if (ch == ERR) continue;
+            if (ch == 'q' || ch == 27) { quit = true; break; }
+            if (ch == 'a') { show_ai_assistant(item.card, item.deck_id); timeout(1000); continue; }
+            if (ch == ' ' || ch == 'y') { grade_card(item, true); graded = true; }
+            else if (ch == 'n') { grade_card(item, false); graded = true; }
+        }
+        if (quit) break;
+    }
+
+    timeout(-1);
+    bool completed = (reviewed >= total);
+    progress.record_session(g_vault_root, "__drill_review__", "", total,
+                            (int)difftime(time(nullptr), session_start), completed);
+    progress.save();
+
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    clear();
+    int box_w = 44, box_h = 9;
+    int box_x = (max_x - box_w) / 2;
+    int box_y = (max_y - box_h) / 2;
+    draw_box(box_y, box_x, box_h, box_w);
+    attron(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    std::string msg = "DRILL REVIEW COMPLETE";
+    mvprintw(box_y + 2, box_x + (box_w - (int)msg.size()) / 2, "%s", msg.c_str());
+    attroff(COLOR_PAIR(CLR_CORRECT) | A_BOLD);
+    char buf[80];
+    int right_count = reviewed - wrong_count;
+    snprintf(buf, sizeof(buf), "%d reviewed   %d right   %d missed", reviewed, right_count,
+             wrong_count);
+    attron(COLOR_PAIR(CLR_DIM));
+    mvprintw(box_y + 4, box_x + (box_w - (int)strlen(buf)) / 2, "%s", buf);
+    std::string hint = "[Press any key]";
+    mvprintw(box_y + 6, box_x + (box_w - (int)hint.size()) / 2, "%s", hint.c_str());
+    attroff(COLOR_PAIR(CLR_DIM));
+    refresh();
+    getch();
+}
+
 int main(int argc, char* argv[])
 {
     // Headless CLI handling (no ncurses) for scripting and package-manager tests.
@@ -4584,7 +5020,7 @@ int main(int argc, char* argv[])
             }
             Progress progress;
             progress.load();
-            auto queue = build_review_queue(progress);
+            auto queue = build_drill_review_pool(progress);
             printf("%d\n", (int)queue.size());
             return 0;
         }
@@ -4620,7 +5056,7 @@ int main(int argc, char* argv[])
 
     while (true)
     {
-        std::vector<ReviewItem> review_queue = build_review_queue(progress);
+        std::vector<ReviewItem> review_queue = build_drill_review_pool(progress);
         int splash_ch = show_splash((int)review_queue.size());
         if (splash_ch == 'q') break;
         if (splash_ch == 'v')
@@ -4630,7 +5066,7 @@ int main(int argc, char* argv[])
         }
         if (splash_ch == 'r')
         {
-            run_review(review_queue, progress);
+            run_drill_review(review_queue, progress);
             continue;
         }
 
@@ -4661,7 +5097,7 @@ int main(int argc, char* argv[])
         while (true)
         {
             std::string deck_root = expand_home(g_deck_dir);
-            std::string deck_path = browse_decks(deck_root);
+            std::string deck_path = browse_decks(deck_root, progress);
             if (deck_path.empty()) break;
 
             auto deck = parse_deck(deck_path);
