@@ -197,6 +197,27 @@ go back, then press `Enter`.
 | `a` | Ask AI about this card |
 | `q` | Quit session |
 
+### Typing an answer
+
+The `t` answer field is a small modal (vi-style) editor. It opens in **insert**
+mode so you can type right away:
+
+| Mode | Key | Action |
+|------|-----|--------|
+| Insert | type | Insert text at the cursor |
+| Insert | `Enter` | New line |
+| Insert | `Backspace`/`Del` | Delete before/at the cursor |
+| Insert | `Esc` | Switch to normal mode |
+| Normal | `Enter` | Submit answer for AI marking |
+| Normal | `i`/`a`/`A` | Insert / after cursor / end of line |
+| Normal | `h`/`j`/`k`/`l`, `0`/`$` | Move cursor / line start / line end |
+| Normal | `q`/`Esc` | Cancel |
+| Both | Arrows, `Home`/`End` | Move the cursor |
+
+Editing works like a normal text buffer — the cursor can move anywhere and
+text is inserted or deleted at that point. For a one-line answer: type it,
+then `Esc` `Enter` to submit.
+
 ### AI Assistant
 | Key | Action |
 |-----|--------|
