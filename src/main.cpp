@@ -2443,11 +2443,79 @@ static std::vector<std::string> hard_wrap_line(const std::string& text, int widt
     return lines;
 }
 
-// Modal (vi-style) multi-line entry. Starts in INSERT: type freely, Enter inserts a newline,
-// Esc switches to NORMAL. In NORMAL: Enter submits, i re-enters insert, q/Esc cancels.
+// One wrapped display row of an editable buffer: a slice [start, start+len) of the source string
+// (excluding any trailing newline). `hard` marks a row that ended on an explicit '\n'.
+struct BufRow
+{
+    int start;
+    int len;
+    bool hard;
+};
+
+// Lay a buffer out into display rows: split on '\n', soft-wrap each segment at `width`.
+static std::vector<BufRow> layout_buffer(const std::string& s, int width)
+{
+    std::vector<BufRow> rows;
+    int w = std::max(1, width);
+    int n = (int)s.size();
+    int start = 0, col = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (s[i] == '\n')
+        {
+            rows.push_back({start, i - start, true});
+            start = i + 1;
+            col = 0;
+        }
+        else if (++col == w)
+        {
+            rows.push_back({start, i - start + 1, false});
+            start = i + 1;
+            col = 0;
+        }
+    }
+    rows.push_back({start, n - start, false}); // trailing (also the empty line after a final '\n')
+    return rows;
+}
+
+// Map a cursor index to its (row, col) display position.
+static void buffer_cursor_rc(const std::vector<BufRow>& rows, int cursor, int& crow, int& ccol)
+{
+    for (int r = 0; r < (int)rows.size(); r++)
+    {
+        int s = rows[r].start, l = rows[r].len, end = s + l;
+        if (cursor < end)
+        {
+            crow = r;
+            ccol = cursor - s;
+            return;
+        }
+        if (cursor == end && (rows[r].hard || r == (int)rows.size() - 1))
+        {
+            crow = r;
+            ccol = l;
+            return;
+        }
+        // soft-wrap boundary (cursor == end, not hard): falls through to next row's column 0
+    }
+    crow = (int)rows.size() - 1;
+    ccol = rows.back().len;
+}
+
+// Map a (row, col) display position back to a cursor index, clamped to the row.
+static int buffer_rc_cursor(const std::vector<BufRow>& rows, int row, int col)
+{
+    row = std::max(0, std::min(row, (int)rows.size() - 1));
+    return rows[row].start + std::max(0, std::min(col, rows[row].len));
+}
+
+// Modal (vi-style) multi-line text buffer. Starts in INSERT: type freely, Enter inserts a
+// newline, Esc switches to NORMAL. In NORMAL: Enter submits, i re-enters insert, q/Esc cancels.
+// Arrows (and h/j/k/l in normal mode) move the cursor; edits happen at the cursor position.
 static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max_rows)
 {
     std::string input;
+    int cursor = 0;
     bool cancelled = false;
     bool insert_mode = true;
     const int max_input_len = 2000;
@@ -2457,19 +2525,20 @@ static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max
     timeout(-1);
     while (true)
     {
-        int max_y, max_x;
-        getmaxyx(stdscr, max_y, max_x);
+        auto rows = layout_buffer(input, visible_w);
+        int crow = 0, ccol = 0;
+        buffer_cursor_rc(rows, cursor, crow, ccol);
+
+        int start_row = crow >= max_rows ? crow - max_rows + 1 : 0;
 
         for (int i = 0; i < max_rows; i++)
             mvhline(y + i, x, ' ', max_w);
-
-        std::vector<std::string> wrapped = hard_wrap_line(input, visible_w);
-        int start = std::max(0, (int)wrapped.size() - max_rows);
-        for (int i = 0; i < max_rows && start + i < (int)wrapped.size(); i++)
+        for (int i = 0; i < max_rows && start_row + i < (int)rows.size(); i++)
         {
-            const std::string prefix = (start + i == 0) ? "> " : "  ";
+            const BufRow& r = rows[start_row + i];
+            const std::string prefix = (start_row + i == 0) ? "> " : "  ";
             mvprintw(y + i, x, "%s", prefix.c_str());
-            addnstr(wrapped[start + i].c_str(), visible_w);
+            addnstr(input.c_str() + r.start, std::min(r.len, visible_w));
         }
 
         // Mode-aware status line, placed inside the card just below the input region.
@@ -2482,40 +2551,67 @@ static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max
         mvaddnstr(status_y, x, status, max_w);
         attroff(COLOR_PAIR(CLR_DIM));
 
-        // Park the cursor at the end of the typed text so it shows in the box, not on the
-        // status line (whatever was drawn last leaves the hardware cursor behind).
+        // Place the hardware cursor at the edit point so it shows in the box.
         curs_set(insert_mode ? 1 : 0);
-        int nlines = std::min((int)wrapped.size() - start, max_rows);
-        if (nlines < 1) nlines = 1;
-        int cur_row = y + nlines - 1;
-        int cur_col = std::min(x + 2 + (int)wrapped[start + nlines - 1].size(), x + max_w - 1);
-        move(cur_row, cur_col);
+        move(y + (crow - start_row), std::min(x + 2 + ccol, x + max_w - 1));
         refresh();
 
         int ch = getch();
+        int n = (int)input.size();
+
+        // Cursor movement, shared by both modes.
+        if (ch == KEY_LEFT) { if (cursor > 0) cursor--; continue; }
+        if (ch == KEY_RIGHT) { if (cursor < n) cursor++; continue; }
+        if (ch == KEY_UP) { if (crow > 0) cursor = buffer_rc_cursor(rows, crow - 1, ccol); continue; }
+        if (ch == KEY_DOWN)
+        {
+            if (crow < (int)rows.size() - 1) cursor = buffer_rc_cursor(rows, crow + 1, ccol);
+            continue;
+        }
+        if (ch == KEY_HOME) { cursor = rows[crow].start; continue; }
+        if (ch == KEY_END) { cursor = rows[crow].start + rows[crow].len; continue; }
+
         if (insert_mode)
         {
-            if (ch == 27) // Esc -> normal mode
-            {
-                insert_mode = false;
-                continue;
-            }
+            if (ch == 27) { insert_mode = false; continue; } // Esc -> normal mode
             if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
             {
-                if ((int)input.size() < max_input_len) input += '\n';
+                if (n < max_input_len) { input.insert(cursor, 1, '\n'); cursor++; }
                 continue;
             }
-            if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty())
-                input.pop_back();
-            else if (ch >= 32 && ch < 127 && (int)input.size() < max_input_len)
-                input += (char)ch;
+            if (ch == KEY_BACKSPACE || ch == 127 || ch == 8)
+            {
+                if (cursor > 0) { input.erase(cursor - 1, 1); cursor--; }
+                continue;
+            }
+            if (ch == KEY_DC) // delete forward
+            {
+                if (cursor < n) input.erase(cursor, 1);
+                continue;
+            }
+            if (ch >= 32 && ch < 127 && n < max_input_len)
+            {
+                input.insert(cursor, 1, (char)ch);
+                cursor++;
+            }
         }
         else // normal mode
         {
             if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) break; // submit
             if (ch == 'i') { insert_mode = true; continue; }
+            if (ch == 'a') { insert_mode = true; if (cursor < n) cursor++; continue; }
+            if (ch == 'A') { insert_mode = true; cursor = rows[crow].start + rows[crow].len; continue; }
             if (ch == 'q' || ch == 27) { cancelled = true; break; }
-            // all other keys ignored in normal mode
+            if (ch == 'h') { if (cursor > 0) cursor--; continue; }
+            if (ch == 'l') { if (cursor < n) cursor++; continue; }
+            if (ch == 'k') { if (crow > 0) cursor = buffer_rc_cursor(rows, crow - 1, ccol); continue; }
+            if (ch == 'j')
+            {
+                if (crow < (int)rows.size() - 1) cursor = buffer_rc_cursor(rows, crow + 1, ccol);
+                continue;
+            }
+            if (ch == '0') { cursor = rows[crow].start; continue; }
+            if (ch == '$') { cursor = rows[crow].start + rows[crow].len; continue; }
         }
     }
     curs_set(0);

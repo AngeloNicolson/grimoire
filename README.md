@@ -204,14 +204,19 @@ mode so you can type right away:
 
 | Mode | Key | Action |
 |------|-----|--------|
-| Insert | type | Enter text |
+| Insert | type | Insert text at the cursor |
 | Insert | `Enter` | New line |
+| Insert | `Backspace`/`Del` | Delete before/at the cursor |
 | Insert | `Esc` | Switch to normal mode |
 | Normal | `Enter` | Submit answer for AI marking |
-| Normal | `i` | Back to insert mode |
+| Normal | `i`/`a`/`A` | Insert / after cursor / end of line |
+| Normal | `h`/`j`/`k`/`l`, `0`/`$` | Move cursor / line start / line end |
 | Normal | `q`/`Esc` | Cancel |
+| Both | Arrows, `Home`/`End` | Move the cursor |
 
-For a one-line answer: type it, then `Esc` `Enter` to submit.
+Editing works like a normal text buffer — the cursor can move anywhere and
+text is inserted or deleted at that point. For a one-line answer: type it,
+then `Esc` `Enter` to submit.
 
 ### AI Assistant
 | Key | Action |
