@@ -2424,23 +2424,42 @@ static std::vector<std::string> hard_wrap_line(const std::string& text, int widt
     std::vector<std::string> lines;
     int safe_width = std::max(1, width);
     if (text.empty()) return {""};
-    for (size_t i = 0; i < text.size(); i += safe_width)
-        lines.push_back(text.substr(i, safe_width));
+    // Split on explicit newlines first, then hard-wrap each segment to the width.
+    size_t start = 0;
+    while (true)
+    {
+        size_t nl = text.find('\n', start);
+        std::string chunk =
+            text.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        if (chunk.empty())
+            lines.push_back("");
+        else
+            for (size_t i = 0; i < chunk.size(); i += safe_width)
+                lines.push_back(chunk.substr(i, safe_width));
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    if (lines.empty()) lines.push_back("");
     return lines;
 }
 
+// Modal (vi-style) multi-line entry. Starts in INSERT: type freely, Enter inserts a newline,
+// Esc switches to NORMAL. In NORMAL: Enter submits, i re-enters insert, q/Esc cancels.
 static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max_rows)
 {
     std::string input;
     bool cancelled = false;
+    bool insert_mode = true;
     const int max_input_len = 2000;
     int visible_w = std::max(1, max_w - 2);
     max_rows = std::max(1, max_rows);
 
-    curs_set(1);
     timeout(-1);
     while (true)
     {
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+
         for (int i = 0; i < max_rows; i++)
             mvhline(y + i, x, ' ', max_w);
 
@@ -2453,21 +2472,50 @@ static TextInputResult get_wrapped_input_result(int y, int x, int max_w, int max
             addnstr(wrapped[start + i].c_str(), visible_w);
         }
 
+        // Mode-aware status line, placed inside the card just below the input region.
+        int status_y = y + max_rows;
+        attron(COLOR_PAIR(CLR_DIM));
+        mvhline(status_y, x, ' ', max_w);
+        const char* status = insert_mode
+                                 ? "-- INSERT --  [Enter] Newline  [Esc] Normal"
+                                 : "-- NORMAL --  [Enter] Submit  [i] Insert  [q] Cancel";
+        mvaddnstr(status_y, x, status, max_w);
+        attroff(COLOR_PAIR(CLR_DIM));
+
+        // Park the cursor at the end of the typed text so it shows in the box, not on the
+        // status line (whatever was drawn last leaves the hardware cursor behind).
+        curs_set(insert_mode ? 1 : 0);
+        int nlines = std::min((int)wrapped.size() - start, max_rows);
+        if (nlines < 1) nlines = 1;
+        int cur_row = y + nlines - 1;
+        int cur_col = std::min(x + 2 + (int)wrapped[start + nlines - 1].size(), x + max_w - 1);
+        move(cur_row, cur_col);
         refresh();
+
         int ch = getch();
-        if (ch == '\n' || ch == KEY_ENTER) break;
-        if (ch == 27)
+        if (insert_mode)
         {
-            cancelled = true;
-            break;
+            if (ch == 27) // Esc -> normal mode
+            {
+                insert_mode = false;
+                continue;
+            }
+            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
+            {
+                if ((int)input.size() < max_input_len) input += '\n';
+                continue;
+            }
+            if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty())
+                input.pop_back();
+            else if (ch >= 32 && ch < 127 && (int)input.size() < max_input_len)
+                input += (char)ch;
         }
-        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !input.empty())
+        else // normal mode
         {
-            input.pop_back();
-        }
-        else if (ch >= 32 && ch < 127 && (int)input.size() < max_input_len)
-        {
-            input += (char)ch;
+            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) break; // submit
+            if (ch == 'i') { insert_mode = true; continue; }
+            if (ch == 'q' || ch == 27) { cancelled = true; break; }
+            // all other keys ignored in normal mode
         }
     }
     curs_set(0);
@@ -3158,7 +3206,7 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
 
     attron(COLOR_PAIR(CLR_DIM));
     mvhline(input_y, input_x, ' ', input_w);
-    mvprintw(input_y, input_x, "Type answer, then Enter");
+    mvprintw(input_y, input_x, "Type your answer:");
     attroff(COLOR_PAIR(CLR_DIM));
     TextInputResult typed =
         get_wrapped_input_result(input_y + 1, input_x, input_w, std::max(1, result_rows - 2));
@@ -4152,7 +4200,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
                 attroff(COLOR_PAIR(CLR_BORDER));
                 attron(COLOR_PAIR(CLR_DIM));
-                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                mvhline(max_y - 2, 1, ' ', std::max(1, max_x - 2));
                 attroff(COLOR_PAIR(CLR_DIM));
                 int total_cards_t = (int)session.cards.size();
                 if (total_cards_t > 0)
@@ -4596,7 +4644,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
                 mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
                 attroff(COLOR_PAIR(CLR_BORDER));
                 attron(COLOR_PAIR(CLR_DIM));
-                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                mvhline(max_y - 2, 1, ' ', std::max(1, max_x - 2));
                 attroff(COLOR_PAIR(CLR_DIM));
                 refresh();
 
@@ -4881,7 +4929,7 @@ static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
                 mvhline(input_y - 1, box_x + 1, ACS_HLINE, content_w - 2);
                 attroff(COLOR_PAIR(CLR_BORDER));
                 attron(COLOR_PAIR(CLR_DIM));
-                mvprintw(max_y - 2, 1, "[Enter] Submit  [Esc] Cancel");
+                mvhline(max_y - 2, 1, ' ', std::max(1, max_x - 2));
                 attroff(COLOR_PAIR(CLR_DIM));
                 refresh();
 
