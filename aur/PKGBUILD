@@ -1,6 +1,6 @@
-# Maintainer: Angelo Nicolson <angelo@idaworks.co.nz>
+# Maintainer: Angelo Nicolson <blair@idaworks.co.nz>
 pkgname=grimoire-git
-pkgver=0.1.0.r2.e201689
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Terminal-based flashcard drill system with persistent mastery tracking"
 arch=('x86_64')
