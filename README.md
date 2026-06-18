@@ -134,7 +134,7 @@ The parent library stores shared metadata and a `vaults/` directory. Each child 
 The default layout is:
 
 ```text
-~/grimoire_knowledge_vault/
+~/.local/share/grimoire/library/
   registry.json
   vaults/
     study/
@@ -150,7 +150,7 @@ The default layout is:
 Grimoire currently drills decks from the active child vault's `decks/` directory. A typical child vault layout looks like:
 
 ```text
-~/grimoire_knowledge_vault/vaults/study/
+~/.local/share/grimoire/library/vaults/study/
   decks/
     networking/
       week_1/

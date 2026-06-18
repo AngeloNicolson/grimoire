@@ -26,7 +26,7 @@ using json = nlohmann::json;
 #define GRIMOIRE_VERSION "0.2.0"
 #endif
 
-static const std::string DEFAULT_LIBRARY_ROOT = "~/grimoire_knowledge_vault";
+static const std::string DEFAULT_LIBRARY_ROOT = "~/.local/share/grimoire/library";
 static const std::string CONFIG_FILE = "~/.config/grimoire/config.json";
 static const std::string DEFAULT_DATA_FILE = "~/.local/share/grimoire/progress.json";
 static const std::string DEFAULT_SESSION_FILE = "~/.local/share/grimoire/session.json";
@@ -1931,7 +1931,7 @@ static void show_note_reader(const std::string& path, const std::string& deck_na
     {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
         std::string elapsed = format_elapsed(session_start);
         attron(COLOR_PAIR(CLR_HEADER));
         mvprintw(0, 1, "%s", elapsed.c_str());
@@ -2628,7 +2628,7 @@ static void draw_centered_message(const std::string& title, const std::vector<st
 {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    clear();
+    erase();
 
     attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
     mvprintw(1, (max_x - (int)title.size()) / 2, "%s", title.c_str());
@@ -2881,7 +2881,7 @@ static bool manage_vaults(AppConfig& config)
         config.ensure_consistency();
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
         std::string title = "Vaults";
@@ -3021,7 +3021,7 @@ static std::string pick_model()
     {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
         std::string title = "Select AI Model";
@@ -3083,7 +3083,7 @@ static std::string ensure_ollama_ready()
 
     if (!ollama_is_running())
     {
-        clear();
+        erase();
         attron(COLOR_PAIR(CLR_DIM));
         mvprintw(max_y / 2, (max_x - 22) / 2, "Starting Ollama...");
         attroff(COLOR_PAIR(CLR_DIM));
@@ -3111,7 +3111,7 @@ static std::string ensure_ollama_ready()
     if (model.empty()) return "";
 
     // Load it
-    clear();
+    erase();
     attron(COLOR_PAIR(CLR_DIM));
     char buf[128];
     snprintf(buf, sizeof(buf), "Loading %s...", model.c_str());
@@ -3131,7 +3131,7 @@ static std::string choose_ai_model()
 
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    clear();
+    erase();
     attron(COLOR_PAIR(CLR_DIM));
     char buf[128];
     snprintf(buf, sizeof(buf), "Loading %s...", model.c_str());
@@ -3157,7 +3157,7 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
     {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         int content_w = std::min(max_x - 4, 70);
         int left = (max_x - content_w) / 2;
@@ -3248,7 +3248,7 @@ static void show_ai_assistant(const Card& card, const std::string& deck)
             std::string question = get_input(max_y - 2, left, content_w);
             if (question.empty()) question = "Explain this card to me";
 
-            clear();
+            erase();
             attron(COLOR_PAIR(CLR_DIM));
             mvprintw(max_y / 2, (max_x - 14) / 2, "Thinking...");
             attroff(COLOR_PAIR(CLR_DIM));
@@ -3393,7 +3393,7 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
             hint = sc;
         }
         else
-            hint = judgement.valid ? "[Any key] Next" : "[Any key] Back without marking";
+            hint = judgement.valid ? "[Enter] Next" : "[Enter] Back without marking";
         mvaddnstr(max_y - 2, 1, hint.c_str(), std::max(1, max_x - 2));
         attroff(COLOR_PAIR(CLR_DIM));
 
@@ -3409,7 +3409,8 @@ static TypedAnswerAction prompt_and_judge_typed_answer(const std::string& model,
             if (scroll > 0) scroll--;
             continue;
         }
-        break;
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) break; // only Enter advances
+        // any other key: ignore and redraw (do not advance to the next card)
     }
     if (!judgement.valid) return TypedAnswerAction::Cancel;
     return suggested_correct ? TypedAnswerAction::Correct : TypedAnswerAction::Wrong;
@@ -3431,7 +3432,7 @@ static int show_splash(int due_count)
     timeout(-1);
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    clear();
+    erase();
 
     int start_y = (max_y - logo.height) / 2 - 2;
     int start_x = (max_x - logo.width) / 2;
@@ -3581,7 +3582,7 @@ static std::string browse_decks(const std::string& root, const Progress& progres
         // Draw
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         // Title bar — show breadcrumb path
         attron(COLOR_PAIR(CLR_TITLE) | A_BOLD);
@@ -3846,7 +3847,7 @@ static bool show_deck_summary(const std::string& deck_name, const std::string& s
     {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         int content_w = std::min(max_x - 4, 60);
         int cx = (max_x - content_w) / 2;
@@ -3981,7 +3982,7 @@ static int choose_saved_deck_session(const std::string& deck_name, const json& s
     {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
-        clear();
+        erase();
 
         int box_w = std::min(std::max(44, (int)deck_name.size() + 12), max_x - 4);
         int box_h = 11;
@@ -4110,7 +4111,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                 int elapsed = (int)difftime(time(nullptr), session_start);
                 int max_y, max_x;
                 getmaxyx(stdscr, max_y, max_x);
-                clear();
+                erase();
 
                 // Centered box
                 int box_w = 46;
@@ -4169,7 +4170,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             int mastered = session.mastered_count();
             draw_drill_header(session, session_start, (int)session.round.size() + 1,
                               (int)session.missed.size());
@@ -4275,7 +4276,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
                              max_typed_card_h);
                 result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
                 int typed_box_y = std::max(6, (max_y - typed_card_h) / 2);
-                clear();
+                erase();
                 draw_drill_header(session, session_start, (int)session.round.size() + 1,
                                   (int)session.missed.size());
                 draw_box(typed_box_y, box_x, typed_card_h, content_w);
@@ -4373,7 +4374,7 @@ static bool run_drill(DrillSession& session, const std::string& deck_path, int e
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             int mastered = session.mastered_count();
             draw_drill_header(session, session_start, (int)session.round.size(),
                               (int)session.missed.size());
@@ -4682,7 +4683,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             draw_review_header(item, idx, total, reviewed, again_count, session_start);
 
             int content_w = std::min(max_x - 6, 60);
@@ -4724,7 +4725,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
                              max_typed_card_h);
                 result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
                 int typed_box_y = std::max(5, (max_y - typed_card_h) / 2);
-                clear();
+                erase();
                 draw_review_header(item, idx, total, reviewed, again_count, session_start);
                 draw_box(typed_box_y, box_x, typed_card_h, content_w);
 
@@ -4795,7 +4796,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             draw_review_header(item, idx, total, reviewed, again_count, session_start);
 
             int content_w = std::min(max_x - 6, 60);
@@ -4879,7 +4880,7 @@ static void run_review(std::vector<ReviewItem>& items, Progress& progress)
 
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    clear();
+    erase();
     int box_w = 44, box_h = 9;
     int box_x = (max_x - box_w) / 2;
     int box_y = (max_y - box_h) / 2;
@@ -4968,7 +4969,7 @@ static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
 
             int content_w = std::min(max_x - 6, 60);
@@ -5009,7 +5010,7 @@ static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
                     std::min(std::max((int)q_lines.size() + result_rows + 7, 16), max_typed_card_h);
                 result_rows = std::max(7, std::min(result_rows, typed_card_h - 7));
                 int typed_box_y = std::max(5, (max_y - typed_card_h) / 2);
-                clear();
+                erase();
                 draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
                 draw_box(typed_box_y, box_x, typed_card_h, content_w);
 
@@ -5054,7 +5055,7 @@ static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
         {
             int max_y, max_x;
             getmaxyx(stdscr, max_y, max_x);
-            clear();
+            erase();
             draw_drill_review_header(item, idx, total, reviewed, wrong_count, session_start);
 
             int content_w = std::min(max_x - 6, 60);
@@ -5109,7 +5110,7 @@ static void run_drill_review(std::vector<ReviewItem>& items, Progress& progress)
 
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
-    clear();
+    erase();
     int box_w = 44, box_h = 9;
     int box_x = (max_x - box_w) / 2;
     int box_y = (max_y - box_h) / 2;
